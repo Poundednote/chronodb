@@ -12,7 +12,7 @@ struct ProcessRequestArgs {
         String8 string;
 };
 
-thread_local Arena thread_local_arena;
+static thread_local Arena thread_local_arena;
 
 void mpmc_work_queue_thread_start_routine(MPMCWorkQueue *wq, size_t arena_size, std::thread *t)
 {
@@ -173,8 +173,11 @@ void *fake_request_handle(void *args) {
                 }
         }
 
-        for (;*buffer != '\n'; ++buffer);
+        for (;*buffer != '\n'; ++buffer) {
+                --string_size;
+        }
         ++buffer;
+        --string_size;
 
         MPMCWorkQueueEntry entry = {};
         
