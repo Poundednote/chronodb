@@ -4,6 +4,8 @@
 #define CACHE_LINE_SIZE 128
 #elif defined (_M_x64) || defined(__x86_64__)
 #define CACHE_LINE_SIZE 64
+#elif defined(_WIN32) || defined(_WIN64)
+#define CACHE_LINE_SIZE 64
 #endif 
 
 

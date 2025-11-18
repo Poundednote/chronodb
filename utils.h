@@ -12,6 +12,8 @@
 #define MEGABYTES(n) (1024 * KILOBYTES(n))
 #define GIGABYTES(n) (1024 * MEGABYTES(n))
 #define arraycount(arr) (sizeof(arr) / sizeof(arr[0]))
+#define REQUEST_POOL_CHUNK_SIZE (MEGABYTES(3))
+#define REQUEST_SLOT_COUNT (64)
 
 struct Arena {
 	void *memory;
@@ -29,21 +31,26 @@ void arena_init(Arena *a, uint32_t capacity);
 void arena_clear(Arena *a);
 void arena_destroy(Arena *a);
 
+struct String8;
+struct StringSlice8;
+struct StringBuilder8;
+
 struct String8 {
-	uint8_t *content;
+	const uint8_t *content;
 	uint64_t length;
 
 	bool operator==(String8 &rhs);
 	bool operator==(const char *rhs);
 	bool operator!=(const char *rhs);
 	bool operator!=(String8 &rhs);
-	uint8_t &operator[](int rhs);
+	uint8_t operator[](int rhs);
 };
 
 struct StringSlice8 {
 	uint8_t *content;
 	uint64_t length;
 	bool operator==(StringSlice8 &rhs);
+	bool operator==(StringBuilder8 &rhs);
 	bool operator==(const char *rhs);
 	bool operator!=(const char *rhs);
 	bool operator!=(StringSlice8 &rhs);
@@ -54,16 +61,20 @@ struct StringBuilder8 {
 	uint8_t *content;
 	uint64_t length;
 	uint64_t capacity;
+	bool operator==(StringSlice8 &rhs);
+	bool operator==(StringBuilder8 &rhs);
+	bool operator==(const char *rhs);
+	bool operator!=(const char *rhs);
+	bool operator!=(StringSlice8 &rhs);
 };
 
 template <typename T> int64_t __string_to_int_template(T s);
 
 #define string8_from_cstring(cstring) \
 	(String8{ (uint8_t *)(cstring), sizeof(cstring) - 1 })
-int string8_index_from_match_end(String8 string, String8 match_string);
-String8 string8_view_after_match_end(String8 string, String8 match_string);
-String8 inline string8_view_from_match_end(String8 string,
-					   String8 match_string);
+StringSlice8 string8_view_after_match_end(String8 string, String8 match_string);
+StringSlice8 inline string8_view_from_match_end(String8 string,
+						String8 match_string);
 String8 string8_concat(Arena *a, String8 s1, String8 s2);
 int64_t string_to_int(String8 s);
 
@@ -123,13 +134,16 @@ void arena_destroy(ThreadSafeArena *a)
 
 void *arena_alloc(ThreadSafeArena *a, uint64_t size)
 {
-        assert(a->memory != nullptr);
+	assert(a->memory != nullptr);
 	assert(a->size + size < a->capacity);
 
 	uint64_t old_size = a->size.fetch_add(size, std::memory_order_acq_rel);
 	void *ptr = (char *)a->memory + old_size;
 	return ptr;
 }
+
+#define arena_alloc_struct(a, struct) (struct *)arena_alloc(a, sizeof(struct))
+#define arena_alloc_struct_array(a, struct, n) (struct *)arena_alloc(a, sizeof(struct) * n)
 
 template <typename T> int64_t __string_to_int_template(T s)
 {
@@ -216,13 +230,28 @@ bool String8::operator!=(String8 &rhs)
 	return !(*this == rhs);
 }
 
-uint8_t &String8::operator[](int rhs)
+uint8_t String8::operator[](int rhs)
 {
 	assert(this->length > rhs);
 	return this->content[rhs];
 }
 
 bool StringSlice8::operator==(StringSlice8 &rhs)
+{
+	if (this->length != rhs.length) {
+		return false;
+	}
+
+	for (int i = 0; i < this->length; ++i) {
+		if (this->content[i] != rhs.content[i]) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+bool StringSlice8::operator==(StringBuilder8 &rhs)
 {
 	if (this->length != rhs.length) {
 		return false;
@@ -276,58 +305,6 @@ uint8_t &StringSlice8::operator[](int rhs)
 	return this->content[rhs];
 }
 
-int string8_index_from_match_end(String8 string, String8 match_string)
-{
-	assert(match_string.length < string.length);
-
-	uint32_t match_index = 0;
-	for (int i = 0; i < string.length; ++i) {
-		if (string[i] == match_string[match_index]) {
-			match_index++;
-			if (match_index == match_string.length) {
-				return i;
-			}
-		} else {
-			match_index = 0;
-		}
-	}
-
-	return -1;
-}
-
-String8 inline string8_view_from_match_end(String8 string, String8 match_string)
-{
-	int new_start_index =
-		string8_index_from_match_end(string, match_string);
-
-	if (new_start_index == -1) {
-		string.length = 0;
-	} else {
-		string.content += new_start_index;
-		string.length -= new_start_index;
-	}
-
-	assert(string.length >= 0);
-
-	return string;
-}
-
-String8 string8_view_after_match_end(String8 string, String8 match_string)
-{
-	int new_start_index =
-		string8_index_from_match_end(string, match_string) + 1;
-
-	if (string.length <= new_start_index) {
-		string.length = 0;
-	} else if (new_start_index == 0) {
-		string.length = 0;
-	} else {
-		string.content += new_start_index;
-		string.length -= new_start_index;
-	}
-	return string;
-}
-
 int64_t string_to_int(String8 s)
 {
 	return __string_to_int_template<String8>(s);
@@ -340,10 +317,31 @@ StringSlice8 string_slice_length(String8 s, int start_index = 0,
 		*(StringSlice8 *)&s, start_index, length);
 }
 
+StringSlice8 string_slice_length(StringSlice8 s, int start_index = 0,
+				 uint32_t length = 0)
+{
+	return __string_slice_length_template<StringSlice8>(
+		*(StringSlice8 *)&s, start_index, length);
+}
+
 StringSlice8 string8_slice_to(String8 s, String8 to_string)
 {
-	int index = string8_index_from_match_end(s, to_string);
-	return string_slice_length(s, 0, index);
+	StringSlice8 result = {};
+	auto match_idx = 0;
+	for (auto i = 0; i < s.length; ++i) {
+		if (to_string[match_idx] == s.content[i]) {
+			match_idx++;
+			if (match_idx == to_string.length) {
+				result.length = i - match_idx + 1;
+				result.content = (uint8_t *)s.content;
+				return result;
+			}
+		} else {
+			match_idx = 0;
+		}
+	}
+
+	return result;
 }
 
 template <typename T> int64_t __index_of_template(T s, char c)
@@ -374,8 +372,22 @@ inline int64_t string_index_of(StringBuilder8 s, char c)
 
 StringSlice8 string8_slice_after(String8 s, String8 after_string)
 {
-	int index = string8_index_from_match_end(s, after_string);
-	return string_slice_length(s, index + 1);
+	StringSlice8 result = {};
+	auto match_idx = 0;
+	for (auto i = 0; i < s.length; ++i) {
+		if (after_string[match_idx] == s.content[i]) {
+			match_idx++;
+			if (match_idx == after_string.length) {
+				result.content = (uint8_t *)s.content + i + 1;
+				result.length = s.length - i + 1;
+				return result;
+			}
+		} else {
+			match_idx = 0;
+		}
+	}
+
+	return result;
 }
 
 String8 string8_concat(Arena *a, String8 s1, String8 s2)
@@ -383,7 +395,7 @@ String8 string8_concat(Arena *a, String8 s1, String8 s2)
 	String8 result = {};
 	result.length = s1.length + s2.length;
 	result.content = (uint8_t *)arena_alloc(a, result.length + 1);
-	uint8_t *current_ptr = result.content;
+	uint8_t *current_ptr = (uint8_t *)result.content;
 	for (int i = 0; i < s1.length; ++i) {
 		*current_ptr++ = s1.content[i];
 	}
@@ -392,7 +404,8 @@ String8 string8_concat(Arena *a, String8 s1, String8 s2)
 		*current_ptr++ = s2.content[i];
 	}
 
-	result.content[result.length] = 0;
+	uint8_t *null_terminator = (uint8_t *)result.content + result.length;
+	*null_terminator = 0;
 
 	return result;
 }
@@ -400,6 +413,7 @@ String8 string8_concat(Arena *a, String8 s1, String8 s2)
 void inline string_builder8_init(Arena *a, StringBuilder8 *sb,
 				 uint64_t capacity)
 {
+	*sb = {};
 	sb->capacity = capacity;
 	sb->content = (uint8_t *)arena_alloc(a, sb->capacity);
 	memset(sb->content, 0, sb->capacity);
@@ -425,9 +439,76 @@ void string_builder8_append(StringBuilder8 *sb, StringSlice8 string)
 
 String8 string_builder8_to_string(StringBuilder8 *sb)
 {
+	assert(sb->length < sb->capacity - 1 &&
+	       "No space for null terminator in string builder to string conversion");
+
 	String8 result = {};
 	result.content = sb->content;
 	result.length = sb->length;
 
 	return result;
 }
+
+bool StringBuilder8::operator==(StringSlice8 &rhs)
+{
+	if (this->length != rhs.length) {
+		return false;
+	}
+
+	for (int i = 0; i < this->length; ++i) {
+		if (this->content[i] != rhs.content[i]) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+bool StringBuilder8::operator==(StringBuilder8 &rhs)
+{
+	if (this->length != rhs.length) {
+		return false;
+	}
+
+	for (int i = 0; i < this->length; ++i) {
+		if (this->content[i] != rhs.content[i]) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+bool StringBuilder8::operator==(const char *rhs)
+{
+	const char *character = rhs;
+	uint32_t index = 0;
+	while (*character != '\0') {
+		if (index >= this->length) {
+			return false;
+		}
+
+		if (this->content[index] != *character) {
+			return false;
+		}
+
+		++character;
+		++index;
+	}
+
+	if (*character != '\0')
+		return false;
+
+	return true;
+}
+
+bool StringBuilder8::operator!=(const char *rhs)
+{
+	return !(*this == rhs);
+}
+
+bool StringBuilder8::operator!=(StringSlice8 &rhs)
+{
+	return !(*this == rhs);
+}
+
