@@ -4,8 +4,8 @@
 #define min(a, b) (a) > (b) ? (a) : (b)
 
 #if defined(_WIN32) 
-#undef max()
-#undef min()
+#undef max
+#undef min
 #include "win32_chrono.cpp"
 #elif defined(__unix)
 #define cpu_pause() _mm_pause()
