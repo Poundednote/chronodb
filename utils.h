@@ -12,20 +12,52 @@
 #include <functional>
 #include <cstddef>
 #include <new>
+#include <string>
+
+#include "chrono_platform.h"
 
 #define DEFAULT_ARENA_SIZE (4096)
 
-#define KILOBYTES(n) (1024 * n)
-#define MEGABYTES(n) (1024 * KILOBYTES(n))
-#define GIGABYTES(n) (1024 * MEGABYTES(n))
+#define KILOBYTES(n) (1024ull * n)
+#define MEGABYTES(n) (1024ull * KILOBYTES(n))
+#define GIGABYTES(n) (1024ull * MEGABYTES(n))
 #define arraycount(arr) (sizeof(arr) / sizeof(arr[0]))
 #define REQUEST_POOL_CHUNK_SIZE (MEGABYTES(3))
-#define REQUEST_SLOT_COUNT (64)
+
+#include <algorithm> 
+
+template <typename T>
+struct DynamicArray {
+    T* data;
+    size_t size;
+    size_t capacity;
+
+    T& operator[](size_t index) {
+        return data[index];
+    }
+};
+
+
+typedef void *(AllocFunction)(size_t);
+template <typename T>
+void dynamic_array_init(DynamicArray<T> *da, AllocFunction f, size_t capacity = 4) {
+	da = {};
+	da->data = f(capacity);
+	da->capacity = capacity;
+}
+
+template <typename T>
+void dynamic_array_push(DynamicArray<T> *da, const T& item) {
+	da->data[da->size] = item;
+	da->size += sizeof(T);
+}
+
 #define string8_to_cstring(string8) ((const char *)string8.content)
+
 
 struct Arena {
 	void *memory;
-	uint64_t size;
+	volatile uint64_t size;
 	uint64_t capacity;
 };
 
@@ -53,79 +85,59 @@ void *arena_alloc(Arena *a, uint64_t size)
 {
 	assert(a->size + size < a->capacity);
 
-	a->size += size;
 	void *ptr = (char *)a->memory + a->size;
+	a->size += size;
 	return ptr;
 }
 
-struct ThreadSafeArena: public Arena {
-        void *memory;
-        std::atomic<uint64_t> size;
-        uint64_t capacity;
-};
-
-
-void arena_init(ThreadSafeArena *a, uint32_t capacity)
-{
-	a->size = 0;
-	a->capacity = capacity;
-
-	a->memory = malloc(capacity);
-
-	assert(a->memory != nullptr);
-}
-
-void arena_clear(ThreadSafeArena *a)
-{
-	a->size = 0;
-}
-
-void arena_destroy(ThreadSafeArena *a)
-{
-	if (a->memory != nullptr) {
-		free(a->memory);
-	}
-}
-
-void *arena_alloc(ThreadSafeArena *a, uint64_t size)
-{
+void *arena_atomic_alloc(Arena *a, uint64_t size) {
 	assert(a->memory != nullptr);
 	assert(a->size + size < a->capacity);
-
-	uint64_t old_size = a->size.fetch_add(size, std::memory_order_relaxed);
+	uint64_t old_size = atomic_fetch_add_u64_rlxd(a->size, size);  
 	void *ptr = (char *)a->memory + old_size;
 	return ptr;
 }
 
 #define arena_alloc_struct(a, struct) (struct *)arena_alloc(a, sizeof(struct))
-#define arena_alloc_struct_array(a, struct, n) (struct *)arena_alloc(a, sizeof(struct) * n)
+#define arena_alloc_struct_array(a, struct, n) (struct *)arena_alloc(a, sizeof(struct) * (n))
 
+#define arena_atomic_alloc_struct(a, struct) (struct *)arena_atomic_alloc(a, sizeof(struct))
+#define arena_atomic_alloc_struct_array(a, struct, n) (struct *)arena_atomic_alloc(a, sizeof(struct) * n)
 
 struct PoolAllocatorFreeListNode {
 	PoolAllocatorFreeListNode *next;
 };
 
 struct PoolAllocator {
-	PoolAllocatorFreeListNode *head;
+	alignas(16) PoolAllocatorFreeListNode *head;
+	int64_t generation;
 	void *memory;
 };
 
+void pool_init(PoolAllocator *p, size_t block_size, size_t block_count, void *memory, size_t memory_size) {
 
-void pool_init(PoolAllocator *p, size_t block_size, size_t block_count) {
-	p->memory = malloc(sizeof(block_size) + sizeof(PoolAllocatorFreeListNode) * block_count);
+	assert(block_size >= sizeof(PoolAllocatorFreeListNode *));
+	assert((block_size * block_count) <= memory_size);
+	p->memory = memory;
 
-	uint8_t *ptr = (uint8_t *)p->memory;
-	auto chunk_size = sizeof(block_size) + sizeof(PoolAllocatorFreeListNode);
-	auto *free_list_node = (PoolAllocatorFreeListNode *)(ptr + chunk_size);
-	for (auto i = 0; i < block_count - 1; ++i) {
-		free_list_node->next = free_list_node + 1;
+	auto chunk_size = sizeof(block_size);
+
+	auto free_list_node = (PoolAllocatorFreeListNode *)p->memory;
+	p->head = free_list_node;
+	for (auto i = 1; i < block_count - 1; ++i) {
+		free_list_node->next = (PoolAllocatorFreeListNode *)p->memory + chunk_size * i;
 		free_list_node = free_list_node->next;
 	}
 
 	free_list_node->next = nullptr;
-
-	p->head = (PoolAllocatorFreeListNode *)ptr;
 	
+}
+
+void pool_init(PoolAllocator *p, size_t block_size, size_t block_count) {
+	size_t memory_size = sizeof(block_size) + sizeof(PoolAllocatorFreeListNode) * block_count;
+	void *memory = malloc(memory_size);
+
+	pool_init(p, block_size, block_count, memory, memory_size);
 }
 
 void *pool_alloc(PoolAllocator *p)
@@ -135,7 +147,31 @@ void *pool_alloc(PoolAllocator *p)
 
 	PoolAllocatorFreeListNode *block = p->head;
 	p->head = p->head->next;
+	p->generation++;
 	return block;
+}
+
+void *pool_atomic_alloc(PoolAllocator *p) {
+
+	int64_t block[2] = {};
+	// need to make sure we do an atomic 128 load of both values 
+	atomic_compare_and_swap_128_rlxd(p->head, 0,  0, block);
+	for (;;) {
+		PoolAllocatorFreeListNode* node_ptr = reinterpret_cast<PoolAllocatorFreeListNode*>(block[0]);
+		if (!node_ptr) {
+			return nullptr;
+		}
+
+		int64_t next_head[2];
+		next_head[0] = reinterpret_cast<int64_t>(node_ptr->next);
+		next_head[1] = block[1] + 1;
+
+		if (atomic_compare_and_swap_128_acq(p->head, next_head[1], next_head[0], block)) {
+			return node_ptr; 
+		} else {
+			cpu_pause();
+		}
+	}
 }
 
 void pool_dealloc(PoolAllocator *p, void *ptr)
@@ -145,135 +181,23 @@ void pool_dealloc(PoolAllocator *p, void *ptr)
 	p->head = block;
 }
 
+void pool_atomic_dealloc(PoolAllocator *p, void *ptr) {
+	auto node_to_free = reinterpret_cast<PoolAllocatorFreeListNode*>(ptr);
 
-template <typename K>
-concept MapKey = std::regular<std::hash<K>> && 
-requires(std::hash<K> h, K k)
-{
-	{ h(k) }->std::convertible_to<std::size_t>;
-} && 
-std::equality_comparable<K>;
+	int64_t expected_head[2] = {};
+	atomic_compare_and_swap_128_rlxd(p->head, 0,  0, expected_head);
+	for (;;) {
+		node_to_free->next = reinterpret_cast<PoolAllocatorFreeListNode*>(expected_head[0]);
+		int64_t block[2];
+		block[0] = reinterpret_cast<int64_t>(ptr);
+		block[1] = expected_head[1] + 1;
 
-template <typename K, typename V> struct ThreadSafeMapBucketNode {
-	K key;
-	V value;
-	ThreadSafeMapBucketNode<K, V> *prev;
-	ThreadSafeMapBucketNode<K, V> *next;
-};
-
-template <typename K, typename V>
-struct alignas(std::hardware_destructive_interference_size) ThreadSafeMapBucket {
-	std::shared_mutex lock;
-	ThreadSafeMapBucketNode<K, V> head;
-	bool active;
-};
-
-// neeed to impl a pool alloactor with free list
-template <typename K, typename V>
-struct ThreadSafeMap {
-	ThreadSafeMapBucket<K, V> *buckets;
-	int64_t bucket_count;
-	PoolAllocator *a;
-
-	void insert(const K &k, const V &v)
-	{
-		auto hash = std::hash<K>{}(k);
-		auto idx =  hash % this.bucket_count;
-
-		ThreadSafeMapBucket<K, V> &bucket = this->buckets[idx];
-		std::unique_lock<std::shared_mutex> lock{bucket.lock};
-
-		if (!bucket.active) {
-			bucket->head.key = k;
-			bucket->head.v = v;
-			bucket.active = true;
-		} else {
-			ThreadSafeMapBucketNode<K, V> *current = bucket->head;
-			ThreadSafeMapBucketNode<K, V> *prev = nullptr;
-			while (current != nullptr) {
-				if (current->key == k) {
-					current->value = v;
-					return;
-				}
-
-				prev = current;
-				current = current->next;
-			}
-
-			prev->next = pool_alloc(a);
-			current = prev->next;
-			current->prev = prev;
-			current->key = k;
-			current->value = v;
+		if (atomic_compare_and_swap_128_rel(&p->head, block[0],
+						    block[1], expected_head)) {
+			return;
 		}
 	}
 
-	void erase(const K &k)
-	{
-		auto hash = std::hash<K>{}(k);
-		auto idx = hash % this.bucket_count;
-
-		ThreadSafeMapBucket<K, V> &bucket = this->buckets[idx];
-		std::unique_lock<std::shared_mutex> lock{bucket.lock};
-
-		ThreadSafeMapBucketNode<K, V> *current = bucket->head;
-		ThreadSafeMapBucketNode<K, V> *prev = current->prev;
-		while (current != nullptr) {
-			if (current->key == k) {
-				break;
-			}
-
-			prev = current;
-			current = current->next;
-		}
-
-		if (!current) {
-			return; // nothing to erase
-		}
-
-		auto next_node = current->next;
-		if (prev) {
-			prev->next = next_node;
-		} else {
-			bucket->active = false;
-		}
-
-		if (next_node) {
-			next_node->prev = prev;
-		}
-
-		pool_dealloc(a, current);
-	}
-
-	V get(const K &k) {
-		auto hash = std::hash<K>{}(k);
-		auto idx = hash % this.bucket_count;
-
-		ThreadSafeMapBucket<K, V> &bucket = this->buckets[idx];
-		std::shared_lock<std::shared_mutex> lock{bucket.lock};
-
-		if (!bucket->active) {
-			return nullptr;
-		}
-
-		ThreadSafeMapBucketNode<K, V> *current = bucket->head;
-		ThreadSafeMapBucketNode<K, V> *prev = current->prev;
-
-		while (current != nullptr) {
-			if (current->key == k) {
-				return *current;
-			}
-		}
-
-		return {}; // return the zero value
-	}
-		
-};
-
-template <typename K, typename V>
-void thread_safe_map_init(ThreadSafeMap<K, V> *m, PoolAllocator *a,
-		     size_t bucket)
-{
 }
 
 struct String8;
@@ -294,11 +218,14 @@ struct String8 {
 struct StringSlice8 {
 	uint8_t *content;
 	int64_t length;
-	bool operator==(StringSlice8 &rhs);
-	bool operator==(StringBuilder8 &rhs);
-	bool operator==(const char *rhs);
-	bool operator!=(const char *rhs);
-	bool operator!=(StringSlice8 &rhs);
+	
+	StringSlice8() : content(0), length(0) {};
+	StringSlice8(String8 s) : content(const_cast<uint8_t *>(s.content)), length(s.length) {};
+	StringSlice8(uint8_t *content, int64_t length) : content(content), length(length) {}
+	StringSlice8(char *content, int64_t length) : content((uint8_t *)content), length(length) {}
+	bool operator==(const StringSlice8 &rhs) const;
+	bool operator==(const StringBuilder8 &rhs) const;
+	bool operator==(const char *rhs) const;
 	uint8_t &operator[](int rhs);
 };
 
@@ -306,17 +233,20 @@ struct StringBuilder8 {
 	uint8_t *content;
 	int64_t length;
 	int64_t capacity;
-	bool operator==(StringSlice8 &rhs);
-	bool operator==(StringBuilder8 &rhs);
-	bool operator==(const char *rhs);
-	bool operator!=(const char *rhs);
-	bool operator!=(StringSlice8 &rhs);
+
+	const bool operator==(const StringSlice8 rhs);
+	const bool operator==(const StringBuilder8 rhs);
+	const bool operator==(const char *rhs);
 };
 
 template <typename T> int64_t __string_to_int_template(T s);
 
 #define string8_from_cstring(cstring) \
 	(String8{ (uint8_t *)(cstring), sizeof(cstring) - 1 })
+#define string8_from_std_string(string) \
+	(String8{ (uint8_t *)(string.c_str()), (int64_t)string.length()})
+#define str_view_from_slice(slice) \
+	(std::string_view{(const char *)slice.content, (size_t)slice.length})
 StringSlice8 string8_view_after_match_end(String8 string, String8 match_string);
 StringSlice8 inline string8_view_from_match_end(String8 string,
 						String8 match_string);
@@ -417,7 +347,7 @@ uint8_t String8::operator[](int rhs)
 	return this->content[rhs];
 }
 
-bool StringSlice8::operator==(StringSlice8 &rhs)
+bool StringSlice8::operator==(const StringSlice8 &rhs) const
 {
 	if (this->length != rhs.length) {
 		return false;
@@ -432,7 +362,7 @@ bool StringSlice8::operator==(StringSlice8 &rhs)
 	return true;
 }
 
-bool StringSlice8::operator==(StringBuilder8 &rhs)
+bool StringSlice8::operator==(const StringBuilder8 &rhs) const
 {
 	if (this->length != rhs.length) {
 		return false;
@@ -447,7 +377,7 @@ bool StringSlice8::operator==(StringBuilder8 &rhs)
 	return true;
 }
 
-bool StringSlice8::operator==(const char *rhs)
+bool StringSlice8::operator==(const char *rhs) const 
 {
 	const char *character = rhs;
 	int index = 0;
@@ -470,16 +400,6 @@ bool StringSlice8::operator==(const char *rhs)
 	return true;
 }
 
-bool StringSlice8::operator!=(const char *rhs)
-{
-	return !(*this == rhs);
-}
-
-bool StringSlice8::operator!=(StringSlice8 &rhs)
-{
-	return !(*this == rhs);
-}
-
 uint8_t &StringSlice8::operator[](int rhs)
 {
 	assert(this->length > rhs);
@@ -491,7 +411,7 @@ int64_t string_to_int(String8 s)
 	return __string_to_int_template<String8>(s);
 }
 
-StringSlice8 string_slice_length(String8 s, int start_index = 0,
+StringSlice8 string_slice_length(String8 s, int64_t start_index = 0,
 				 int64_t length = 0)
 {
 	return __string_slice_length_template<StringSlice8>(
@@ -521,6 +441,16 @@ StringSlice8 string8_slice_to(String8 s, String8 to_string)
 			match_idx = 0;
 		}
 	}
+
+	return result;
+}
+
+String8 string8_from_slice(StringSlice8 s, Arena *a) {
+	String8 result{};
+	result.content = (const uint8_t *)arena_alloc(a, s.length + 1);
+	result.length = s.length;
+	std::memset((void *)result.content, 0, s.length);
+	std::memcpy((void *)result.content, s.content, s.length);
 
 	return result;
 }
@@ -571,15 +501,16 @@ StringSlice8 string8_slice_after(String8 s, String8 after_string)
 	return result;
 }
 
-String8 string8_from_char_buff(const char *buffer, size_t capacity) {
+String8 string8_from_char_buff(const char *buffer, size_t length) {
 	
-	int64_t length = 0;
+	int64_t real_length = 0;
+	const char *start = buffer;
 	for (; *buffer != 0; ++buffer) {
-		++length;
+		++real_length;
 	}
 
-	assert (length < capacity);
-	return String8{(uint8_t *)buffer, length};
+	assert (real_length <= length);
+	return String8{(uint8_t *)start, real_length};
 }
 String8 string8_concat(Arena *a, String8 s1, String8 s2)
 {
@@ -619,6 +550,15 @@ void string_builder8_append(StringBuilder8 *sb, String8 string)
 	}
 }
 
+void string_builder8_append(StringBuilder8 *sb, StringBuilder8 string)
+{
+	assert(sb->length + string.length < sb->capacity);
+
+	for (auto i = 0; i < string.length; ++i) {
+		sb->content[sb->length++] = string.content[i];
+	}
+}
+
 void string_builder8_append(StringBuilder8 *sb, StringSlice8 string)
 {
 	assert(sb->length + string.length < sb->capacity);
@@ -640,7 +580,7 @@ String8 string_builder8_to_string(StringBuilder8 *sb)
 	return result;
 }
 
-bool StringBuilder8::operator==(StringSlice8 &rhs)
+const bool StringBuilder8::operator==(const StringSlice8 rhs)
 {
 	if (this->length != rhs.length) {
 		return false;
@@ -655,7 +595,7 @@ bool StringBuilder8::operator==(StringSlice8 &rhs)
 	return true;
 }
 
-bool StringBuilder8::operator==(StringBuilder8 &rhs)
+const bool StringBuilder8::operator==(const StringBuilder8 rhs)
 {
 	if (this->length != rhs.length) {
 		return false;
@@ -670,7 +610,7 @@ bool StringBuilder8::operator==(StringBuilder8 &rhs)
 	return true;
 }
 
-bool StringBuilder8::operator==(const char *rhs)
+const bool StringBuilder8::operator==(const char *rhs)
 {
 	const char *character = rhs;
 	uint32_t index = 0;
@@ -693,15 +633,444 @@ bool StringBuilder8::operator==(const char *rhs)
 	return true;
 }
 
-bool StringBuilder8::operator!=(const char *rhs)
-{
-	return !(*this == rhs);
+namespace std {
+    template<>
+    struct hash<StringSlice8> {
+        std::size_t operator()(const StringSlice8& k) const noexcept {
+            return std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char *>(k.content), k.length));
+        }
+    };
 }
 
-bool StringBuilder8::operator!=(StringSlice8 &rhs)
-{
-	return !(*this == rhs);
+namespace std {
+    template<>
+    struct hash<String8> {
+        std::size_t operator()(const String8& k) const noexcept {
+            // Delegate to std::string_view for a zero-copy hash
+            // This treats your raw data as a string without allocating new memory
+            return std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char *>(k.content), k.length));
+        }
+    };
 }
 
+
+
+template <typename K>
+concept MapKey = std::semiregular<std::hash<K>> && 
+requires(std::hash<K> h, K k)
+{
+	{ h(k) }->std::convertible_to<std::size_t>;
+} && 
+std::equality_comparable<K>;
+
+template <MapKey K, typename V> struct ThreadSafeMapBucketNode {
+	K key;
+	V value;
+	ThreadSafeMapBucketNode<K, V> *prev;
+	ThreadSafeMapBucketNode<K, V> *next;
+	uint64_t hash;
+};
+
+template <MapKey K, typename V>
+struct alignas(std::hardware_destructive_interference_size) ThreadSafeMapBucket {
+	std::shared_mutex lock;
+	ThreadSafeMapBucketNode<K, V> head;
+	bool active;
+};
+
+template <MapKey K, typename V>
+struct ThreadSafeMap {
+	ThreadSafeMapBucket<K, V> *buckets;
+	int64_t bucket_count;
+	PoolAllocator *a; // make clear that pool is owned by map
+
+	void insert(const K &k, const V &v)
+	{
+		auto hash = std::hash<K>{}(k);
+		auto idx =  hash % this->bucket_count;
+
+		ThreadSafeMapBucket<K, V> &bucket = this->buckets[idx];
+		std::unique_lock<std::shared_mutex> lock{bucket.lock};
+
+		if (!bucket.active) {
+			bucket.head.key = k;
+			bucket.head.value = v;
+			bucket.active = true;
+		} else {
+			ThreadSafeMapBucketNode<K, V> *current = &bucket.head;
+			ThreadSafeMapBucketNode<K, V> *prev = nullptr;
+			while (current != nullptr) {
+				// check hash first faster for complext types e.g. string_view
+				if (current->hash == hash) {
+					if (current->key == k) {
+						current->value = v;
+						return;
+					}
+				}
+
+				prev = current;
+				current = current->next;
+			}
+
+			// it is safe to cast to a bucket node only because the pool allocates in type of 
+			// ThreadSafeMapBucket chunks and the ThreadSafeMapBucket contains the ThreadSafeMapBucketNode
+
+			prev->next = (ThreadSafeMapBucketNode<K, V> *)pool_alloc(a);
+			current = prev->next;
+
+			current->prev = prev;
+			current->hash = hash;
+			current->key = k;
+			current->value = v;
+		}
+	}
+
+	V insert_or_get(const K &k, const V &v) 
+	{
+		auto hash = std::hash<K>{}(k);
+		auto idx = hash % this->bucket_count;
+
+		ThreadSafeMapBucket<K, V> &bucket = this->buckets[idx];
+		std::unique_lock<std::shared_mutex> lock{bucket.lock};
+
+		if (!bucket.active) {
+			bucket.head.key = k;
+			bucket.head.value = v;
+			bucket.active = true;
+
+		} else {
+
+			// start the walk
+			ThreadSafeMapBucketNode<K, V> *current = &bucket.head;
+			ThreadSafeMapBucketNode<K, V> *prev = nullptr;
+			while(current != nullptr) {
+				if (current->hash == hash) {
+					if (current->key == k) {
+						return current->value;
+					}
+				}
+			}
+
+			prev->next = (ThreadSafeMapBucketNode<K, V> *)pool_alloc(a);
+			current = prev->next;
+
+			current->prev = prev;
+			current->hash = hash;
+			current->key = k;
+			current->value = v;
+		}
+
+		return V{};
+
+	}
+
+	// only insert if the thing doesn't exists
+	//void insert_if_no_exists(
+
+	void erase(const K &k)
+	{
+		auto hash = std::hash<K>{}(k);
+		auto idx = hash % this.bucket_count;
+
+		ThreadSafeMapBucket<K, V> &bucket = this->buckets[idx];
+		std::unique_lock<std::shared_mutex> lock{bucket.lock};
+
+		ThreadSafeMapBucketNode<K, V> *current = bucket->head;
+		ThreadSafeMapBucketNode<K, V> *prev = current->prev;
+		while (current != nullptr) {
+			if (current->key == k) {
+				break;
+			}
+
+			prev = current;
+			current = current->next;
+		}
+
+		if (!current) {
+			return; // nothing to erase
+		}
+
+		auto next_node = current->next;
+		if (prev) {
+			prev->next = next_node;
+		} else {
+			bucket->active = false;
+		}
+
+		if (next_node) {
+			next_node->prev = prev;
+		}
+
+		pool_dealloc(a, current);
+	}
+
+	V get(const K &k) {
+		auto hash = std::hash<K>{}(k);
+		auto idx = hash % this->bucket_count;
+
+		ThreadSafeMapBucket<K, V> &bucket = this->buckets[idx];
+		std::shared_lock<std::shared_mutex> lock{bucket.lock};
+
+		if (!bucket.active) {
+			return V{};
+		}
+
+		ThreadSafeMapBucketNode<K, V> *current = &bucket.head;
+		ThreadSafeMapBucketNode<K, V> *prev = current->prev;
+
+		while (current != nullptr) {
+			if (current->key == k) {
+				return current->value;
+			}
+		}
+
+		return V{}; // return the zero value
+	}
+		
+};
+
+template <MapKey K, typename V>
+void thread_safe_map_init(ThreadSafeMap<K, V> *m, PoolAllocator *a, size_t buckets)
+{
+	m->a = a;
+	m->bucket_count = buckets;
+	m->buckets = (ThreadSafeMapBucket<K, V> *)pool_alloc(a);
+	for (auto i = 1; i < buckets; ++i) {
+		pool_alloc(a);
+	}
+}
+
+template <MapKey K, typename V>
+void thread_safe_map_init(ThreadSafeMap<K, V> *m, Arena *a, size_t buckets) 
+{
+	auto p = (PoolAllocator *)arena_alloc(a, sizeof(PoolAllocator));
+	size_t bucket_size = sizeof(*m->buckets);
+	size_t max_pool_blocks = buckets * 2;
+	size_t pool_memory_size = max_pool_blocks * bucket_size;
+	void *pool_memory = arena_alloc(a, pool_memory_size);
+	pool_init(p, bucket_size, max_pool_blocks, pool_memory, pool_memory_size);
+
+	m->a = p;
+	m->bucket_count = buckets;
+	m->buckets = (ThreadSafeMapBucket<K, V> *)pool_alloc(p);
+	for (auto i = 1; i < buckets; ++i) {
+		pool_alloc(p);
+
+	}
+}
+
+template <MapKey K, typename V> struct HashMapBucketNode {
+	K key;
+	V value;
+	HashMapBucketNode<K, V> *prev;
+	HashMapBucketNode<K, V> *next;
+	uint64_t hash;
+};
+
+template <MapKey K, typename V>
+struct HashMapBucket {
+	HashMapBucketNode<K, V> head;
+	bool active;
+};
+
+template <typename V>
+struct HashMapClosedAddrInsertOrGetResult {
+	V *value;
+	bool exists;
+};
+
+template <MapKey K, typename V>
+struct HashMapClosedAddr {
+	HashMapBucket<K, V> *buckets;
+	int64_t bucket_count;
+	PoolAllocator *a; // make clear that pool is owned by map
+
+	V *insert(const K &k, const V &v)
+	{
+		auto hash = std::hash<K>{}(k);
+		auto idx =  hash % this->bucket_count;
+
+		HashMapBucket<K, V> &bucket = this->buckets[idx];
+
+		if (!bucket.active) {
+			bucket.head.key = k;
+			bucket.head.value = v;
+			bucket.active = true;
+		} else {
+			HashMapBucketNode<K, V> *current = &bucket.head;
+			HashMapBucketNode<K, V> *prev = nullptr;
+			while (current != nullptr) {
+				// check hash first faster for complext types e.g. string_view
+				if (current->hash == hash) {
+					if (current->key == k) {
+						current->value = v;
+						return &current->value;
+					}
+				}
+
+				prev = current;
+				current = current->next;
+			}
+
+			//TODO(Ray) find a way to allocate just a node the current way just feels hacky
+			prev->next = (HashMapBucketNode<K, V> *)pool_alloc(a);
+			current = prev->next;
+
+			current->prev = prev;
+			current->hash = hash;
+			current->key = k;
+			current->value = v;
+
+			return &current->value;
+		}
+	}
+
+	
+HashMapClosedAddrInsertOrGetResult<V> insert_or_get(const K &k, const V &v) 
+	{
+		auto hash = std::hash<K>{}(k);
+		auto idx = hash % this->bucket_count;
+
+		HashMapBucket<K, V> &bucket = this->buckets[idx];
+
+		if (!bucket.active) {
+			bucket.head.key = k;
+			bucket.head.value = v;
+			bucket.active = true;
+
+		} else {
+
+			// start the walk
+			HashMapBucketNode<K, V> *current = &bucket.head;
+			HashMapBucketNode<K, V> *prev = nullptr;
+			while(current != nullptr) {
+				if (current->hash == hash) {
+					if (current->key == k) {
+						return {current->value, true};
+					}
+				}
+			}
+
+			prev->next = (HashMapBucketNode<K, V> *)pool_alloc(a);
+			current = prev->next;
+
+			current->prev = prev;
+			current->hash = hash;
+			current->key = k;
+			current->value = v;
+			return {current->value, false};
+		}
+	}
+
+	void erase(const K &k)
+	{
+		auto hash = std::hash<K>{}(k);
+		auto idx = hash % this.bucket_count;
+
+		HashMapBucket<K, V> &bucket = this->buckets[idx];
+
+		HashMapBucketNode<K, V> *current = bucket->head;
+		HashMapBucketNode<K, V> *prev = current->prev;
+		while (current != nullptr) {
+			if (current->key == k) {
+				break;
+			}
+
+			prev = current;
+			current = current->next;
+		}
+
+		if (!current) {
+			return; // nothing to erase
+		}
+
+		auto next_node = current->next;
+		if (prev) {
+			prev->next = next_node;
+		} else {
+			bucket->active = false;
+		}
+
+		if (next_node) {
+			next_node->prev = prev;
+		}
+
+		pool_dealloc(a, current);
+	}
+
+	V *get(const K &k) {
+		auto hash = std::hash<K>{}(k);
+		auto idx = hash % this->bucket_count;
+
+		HashMapBucket<K, V> &bucket = this->buckets[idx];
+
+		if (!bucket.active) {
+			return nullptr;
+		}
+
+		HashMapBucketNode<K, V> *current = &bucket.head;
+		HashMapBucketNode<K, V> *prev = current->prev;
+
+		while (current != nullptr) {
+			if (current->key == k) {
+				return &current->value;
+			}
+		}
+
+		return nullptr; // return the zero value
+	}
+
+	bool in(const K &k) {
+		auto hash = std::hash<K>{}(k);
+		auto idx = hash % this->bucket_count;
+
+		HashMapBucket<K, V> &bucket = this->buckets[idx];
+
+		if (!bucket.active) {
+			return false;
+		}
+
+		HashMapBucketNode<K, V> *current = &bucket.head;
+		HashMapBucketNode<K, V> *prev = current->prev;
+
+		while (current != nullptr) {
+			if (current->key == k) {
+				return true;
+			}
+		}
+
+		return false; // return the zero value
+
+	}
+};
+
+template <MapKey K, typename V>
+void hash_map_init(HashMapClosedAddr<K, V> *m, PoolAllocator *a, size_t buckets)
+{
+	m->a = a;
+	m->bucket_count = buckets;
+	m->buckets = (HashMapBucket<K, V> *)pool_alloc(a);
+	for (auto i = 1; i < buckets; ++i) {
+		pool_alloc(a);
+	}
+}
+
+template <MapKey K, typename V>
+void hash_map_init(HashMapClosedAddr<K, V> *m, Arena *a, size_t buckets) 
+{
+	auto p = (PoolAllocator *)arena_alloc(a, sizeof(PoolAllocator));
+	size_t bucket_size = sizeof(*m->buckets);
+	size_t max_pool_blocks = buckets * 2;
+	size_t pool_memory_size = max_pool_blocks * bucket_size;
+	void *pool_memory = arena_alloc(a, pool_memory_size);
+	pool_init(p, bucket_size, max_pool_blocks, pool_memory, pool_memory_size);
+
+	m->a = p;
+	m->bucket_count = buckets;
+	m->buckets = (HashMapBucket<K, V> *)pool_alloc(p);
+	for (auto i = 1; i < buckets; ++i) {
+		pool_alloc(p);
+	}
+}
 
 #define string_builder8_to_string(sb) String8{sb.content, sb.length}

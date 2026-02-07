@@ -1,14 +1,10 @@
 #include <atomic>
 
 #include "workqueue.h"
+#include "chrono_platform.h"
 #include "utils.h"
 
-#if defined(_M_X64) || defined(__x86_64__)
-#include <intrin.h>
-#define cpu_pause() _mm_pause()
-#elif defined(_M_ARM64) || defined(__aarch64__)
-#define cpu_pause() __asm__ __volatile__("yield")
-#endif
+#define WQ_TASK(name, ...) void *name(ThreadContext *t_ctx, void *args)
 
 void mpmc_work_queue_init(MPMCWorkQueue *wq, Arena *a, uint32_t work_capacity,
 			  uint64_t thread_arena_capacity)
@@ -19,38 +15,33 @@ void mpmc_work_queue_init(MPMCWorkQueue *wq, Arena *a, uint32_t work_capacity,
 		a, sizeof(*wq->entries) * work_capacity);
 }
 
-void mpmc_work_queue_init(MPMCWorkQueue *wq, ThreadSafeArena *a, uint32_t work_capacity,
-			  uint64_t thread_arena_capacity)
-{
-	memset(wq, 0, sizeof(MPMCWorkQueue));
-	wq->capacity = work_capacity;
-	wq->entries = (MPMCWorkQueueEntry *)arena_alloc(
-		a, sizeof(*wq->entries) * work_capacity);
-}
-
-void mpmc_work_queue_dequeue_entry(MPMCWorkQueue *wq)
+void mpmc_work_queue_dequeue_entry(ThreadContext *t_ctx, MPMCWorkQueue *wq)
 {
 	uint64_t head = wq->head.load(std::memory_order_relaxed);
 	uint64_t next_head_index = head + 1;
-	uint64_t tail = wq->tail.load(std::memory_order_acquire);
+	uint64_t tail = wq->tail.load(std::memory_order_relaxed);
 	if (tail == 0xFFFFFFFFFFFFFFFF) {
 		return;
 	}
 
 	if (head < wq->tail.load(std::memory_order_acquire)) {
 		bool success = wq->head.compare_exchange_strong(
-			head, next_head_index, std::memory_order_relaxed,
+			head, next_head_index, std::memory_order_acq_rel,
 			std::memory_order_relaxed);
 
 		if (success) {
 			uint64_t queue_mask = wq->capacity - 1;
-			MPMCWorkQueueEntry *entry =
+			auto *entry =
 				&wq->entries[head & queue_mask];
+			while (entry->seq_num.load(std::memory_order_acquire) != head + 1) {
+				cpu_pause();
+			}
 
-			entry->callback(entry->callback_args);
-
+			entry->payload.callback((ThreadContext *)t_ctx, entry->payload.callback_args);
+			entry->seq_num.store(head + wq->capacity, std::memory_order_release);
 			wq->completion_count.fetch_add(
 				1, std::memory_order_release);
+
 		}
 	} else {
 		uint64_t tail = wq->tail.load(std::memory_order_relaxed);
@@ -68,7 +59,7 @@ void inline mpmc_end_producer(MPMCWorkQueue *wq)
 	wq->producer_count.fetch_sub(1, std::memory_order_release);
 }
 
-void mpmc_work_queue_enqueue_entry(MPMCWorkQueue *wq, MPMCWorkQueueEntry entry)
+void mpmc_work_queue_enqueue_entry(MPMCWorkQueue *wq, MPMCWorkQueuePayload payload)
 {
 	// TODO(Ray): Make make multiproducer safe safe
 	// need bounds check on size of queue and just block if you can't add anymore data
@@ -83,14 +74,15 @@ void mpmc_work_queue_enqueue_entry(MPMCWorkQueue *wq, MPMCWorkQueueEntry entry)
 
 		// need to use relative offsets because tail may wrap before head
 		if ((tail - head) < wq->capacity) {
-			if (wq->tail.compare_exchange_strong(
-				    tail, next_tail_index,
-				    std::memory_order_relaxed,
-				    std::memory_order_relaxed)) {
-				wq->entries[tail & mask] = entry;
-				// make sure this write happens before the notify
-				std::atomic_thread_fence(
-					std::memory_order_release);
+			if (wq->tail.compare_exchange_weak(tail, next_tail_index, std::memory_order_relaxed,
+							   std::memory_order_relaxed)) {
+				MPMCWorkQueueEntry *wq_entry = &wq->entries[tail & mask];
+				// need to make sure the consumer has actaully finished using this data
+				while (wq_entry->seq_num.load(std::memory_order_acquire) != tail) {
+					cpu_pause();
+				}
+				wq_entry->payload = payload; // write the data
+				wq_entry->seq_num.store(tail + 1, std::memory_order_release);
 				wq->tail.notify_all();
 				break; // succesful can stop trying
 			}
@@ -114,4 +106,53 @@ void mpmc_work_queue_stop(MPMCWorkQueue *wq)
         wq->stop_flag.store(true, std::memory_order_release);
         wq->tail.store(0xFFFFFFFFFFFFFFFF, std::memory_order_relaxed);
         wq->tail.notify_all();
+}
+
+void mpsc_writer_enqueue(MPSCWriterQueue *wq, void *data) 
+{
+	uint64_t tail = wq->tail.load(std::memory_order_relaxed);
+	uint64_t head = wq->head.load(std::memory_order_relaxed);
+	uint64_t next_tail_index = tail + 1;
+	uint64_t mask = wq->capacity - 1;
+
+	for (;;) {
+		if ((tail - head) < wq->capacity) {
+			if (wq->tail.compare_exchange_weak(tail, next_tail_index, std::memory_order_relaxed,
+							   std::memory_order_relaxed)) {
+				MPSCWriteQueueEntry *wq_entry = &wq->entries[tail & mask];
+
+				while (wq_entry->seq_num.load(std::memory_order_acquire) != tail) {
+					cpu_pause();
+				}
+
+				wq_entry->data = data;
+				wq_entry->seq_num.store(tail + 1, std::memory_order_release);
+				wq->tail.notify_all();
+				break;
+			}
+		} else {
+			cpu_pause();
+		}
+	}
+}
+
+void mpsc_writer_dequeue(MPSCWriterQueue *wq, void *data) 
+{
+	uint64_t head = wq->head.load(std::memory_order_relaxed);
+	uint64_t mask = wq->capacity - 1;
+	auto tail = wq->tail.load(std::memory_order_relaxed);
+
+	if (head < tail) {
+		auto wq_entry = &wq->entries[head & mask];
+		wq->head.fetch_add(1, std::memory_order_relaxed);
+		while (wq_entry->seq_num.load(std::memory_order_acquire) != head + 1) {
+			cpu_pause();
+		}
+
+		// do something with payload
+		//
+		wq_entry->seq_num.store(head + wq->capacity, std::memory_order_release);
+	} else {
+		wq->tail.wait(tail);
+	}
 }
