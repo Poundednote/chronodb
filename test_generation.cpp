@@ -16,7 +16,7 @@ int main(void)
 	MemoryMappedFile data_dict_file = {};
 	memory_map_file_handle_append(&data_dict_file, fh, KILOBYTES(256));
 
-	auto num_rows = 2;
+	uint32_t num_rows = 2;
 	{
 		auto data_dict_header = DataDictHeader{ num_rows, sizeof(DataDictSchema), sizeof(DataDictHeader) };
 		mmf_append_struct(&data_dict_file, &data_dict_header);
@@ -53,10 +53,14 @@ int main(void)
 		mmf_append_struct(&schema_file, &table_header);
 
 		ColumnInfo info;
-		info.name = string8_from_cstring("testcolumn");
-		info.type = ColumnDataType::INT32;
-
+		info.name = string8_from_cstring("testcolumn0");
+		info.type = ColumnDataType::INT64;
 		put_column_info_on_disk_schema_column(&info, &schema_file);
+
+		info.name = string8_from_cstring("testcolumn1");
+		info.type = ColumnDataType::INT64;
+		put_column_info_on_disk_schema_column(&info, &schema_file);
+
 	}
 
 	FlushViewOfFile(data_dict_file.mapping, 0);

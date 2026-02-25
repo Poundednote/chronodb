@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <new>
 #include <string>
+#include <algorithm>
 
 #include "chrono_platform.h"
 
@@ -36,7 +37,6 @@ struct DynamicArray {
         return data[index];
     }
 };
-
 
 typedef void *(AllocFunction)(size_t);
 template <typename T>
@@ -67,7 +67,6 @@ void arena_init(Arena *a, uint32_t capacity)
 	a->capacity = capacity;
 
 	a->memory = malloc(capacity);
-
 	assert(a->memory != nullptr);
 }
 
@@ -81,27 +80,43 @@ void arena_destroy(Arena *a)
 	free(a->memory);
 }
 
-void *arena_alloc(Arena *a, uint64_t size)
+void *arena_alloc(Arena *a, uint64_t size, uint64_t alignment = 8)
 {
-	assert(a->size + size < a->capacity);
+	assert(a->memory != nullptr);
+  size_t aligned_offset = (a->size + (alignment - 1)) & ~(alignment - 1);
+  void *ptr = (uint8_t *)a->memory + aligned_offset;
 
-	void *ptr = (char *)a->memory + a->size;
-	a->size += size;
+  assert(aligned_offset + size <= a->capacity);
+  assert(aligned_offset % alignment == 0);
+	a->size = aligned_offset + size;
 	return ptr;
 }
 
-void *arena_atomic_alloc(Arena *a, uint64_t size) {
+/*
+void *arena_atomic_alloc(Arena *a, uint64_t size, uint64_t alignment) {
 	assert(a->memory != nullptr);
 	assert(a->size + size < a->capacity);
+
+  size_t aligned_offset = (a->size + (alignment - 1)) & ~(alignment - 1);
+  void *ptr = (uint8_t *)a->memory + aligned_offset;
+	a->size = aligned_offset + size;
 	uint64_t old_size = atomic_fetch_add_u64_rlxd(a->size, size);  
 	void *ptr = (char *)a->memory + old_size;
 	return ptr;
 }
+*/
 
-#define arena_alloc_struct(a, struct) (struct *)arena_alloc(a, sizeof(struct))
-#define arena_alloc_struct_array(a, struct, n) (struct *)arena_alloc(a, sizeof(struct) * (n))
+void *arena_alloc_zero(Arena *a, uint64_t size, uint64_t alignment) 
+{
+  auto ptr = arena_alloc(a, size, alignment);
+  std::memset(ptr, 0, size);
+  return ptr;
+}
 
-#define arena_atomic_alloc_struct(a, struct) (struct *)arena_atomic_alloc(a, sizeof(struct))
+#define arena_alloc_struct(a, struct) (struct *)arena_alloc(a, sizeof(struct), alignof(struct))
+#define arena_alloc_struct_array(a, struct, n) (struct *)arena_alloc(a, sizeof(struct) * (n), alignof(struct))
+
+#define arena_atomic_alloc_struct(a, struct) (struct *)arena_atomic_alloc(a, sizeof(struct), alignof(struct))
 #define arena_atomic_alloc_struct_array(a, struct, n) (struct *)arena_atomic_alloc(a, sizeof(struct) * n)
 
 struct PoolAllocatorFreeListNode {
@@ -116,16 +131,14 @@ struct PoolAllocator {
 
 void pool_init(PoolAllocator *p, size_t block_size, size_t block_count, void *memory, size_t memory_size) {
 
-	assert(block_size >= sizeof(PoolAllocatorFreeListNode *));
+	auto chunk_size = std::max(block_size, sizeof(PoolAllocatorFreeListNode *));
 	assert((block_size * block_count) <= memory_size);
 	p->memory = memory;
-
-	auto chunk_size = sizeof(block_size);
 
 	auto free_list_node = (PoolAllocatorFreeListNode *)p->memory;
 	p->head = free_list_node;
 	for (auto i = 1; i < block_count - 1; ++i) {
-		free_list_node->next = (PoolAllocatorFreeListNode *)p->memory + chunk_size * i;
+		free_list_node->next = (PoolAllocatorFreeListNode *)((uint8_t *)p->memory + chunk_size * i);
 		free_list_node = free_list_node->next;
 	}
 
@@ -134,7 +147,7 @@ void pool_init(PoolAllocator *p, size_t block_size, size_t block_count, void *me
 }
 
 void pool_init(PoolAllocator *p, size_t block_size, size_t block_count) {
-	size_t memory_size = sizeof(block_size) + sizeof(PoolAllocatorFreeListNode) * block_count;
+	size_t memory_size = (std::max(block_size, sizeof(PoolAllocatorFreeListNode))) * block_count;
 	void *memory = malloc(memory_size);
 
 	pool_init(p, block_size, block_count, memory, memory_size);
@@ -148,6 +161,7 @@ void *pool_alloc(PoolAllocator *p)
 	PoolAllocatorFreeListNode *block = p->head;
 	p->head = p->head->next;
 	p->generation++;
+
 	return block;
 }
 
@@ -447,7 +461,7 @@ StringSlice8 string8_slice_to(String8 s, String8 to_string)
 
 String8 string8_from_slice(StringSlice8 s, Arena *a) {
 	String8 result{};
-	result.content = (const uint8_t *)arena_alloc(a, s.length + 1);
+	result.content = arena_alloc_struct_array(a, uint8_t, s.length + 1);
 	result.length = s.length;
 	std::memset((void *)result.content, 0, s.length);
 	std::memcpy((void *)result.content, s.content, s.length);
@@ -516,7 +530,7 @@ String8 string8_concat(Arena *a, String8 s1, String8 s2)
 {
 	String8 result = {};
 	result.length = s1.length + s2.length;
-	result.content = (uint8_t *)arena_alloc(a, result.length + 1);
+	result.content = arena_alloc_struct_array(a, uint8_t, result.length + 1);
 	uint8_t *current_ptr = (uint8_t *)result.content;
 	for (int i = 0; i < s1.length; ++i) {
 		*current_ptr++ = s1.content[i];
@@ -537,7 +551,7 @@ void inline string_builder8_init(Arena *a, StringBuilder8 *sb,
 {
 	*sb = {};
 	sb->capacity = capacity;
-	sb->content = (uint8_t *)arena_alloc(a, sb->capacity);
+	sb->content = arena_alloc_struct_array(a, uint8_t, sb->capacity);
 	memset(sb->content, 0, sb->capacity);
 }
 
@@ -843,7 +857,7 @@ void thread_safe_map_init(ThreadSafeMap<K, V> *m, PoolAllocator *a, size_t bucke
 template <MapKey K, typename V>
 void thread_safe_map_init(ThreadSafeMap<K, V> *m, Arena *a, size_t buckets) 
 {
-	auto p = (PoolAllocator *)arena_alloc(a, sizeof(PoolAllocator));
+	auto p = arena_alloc_struct(a, PoolAllocator);
 	size_t bucket_size = sizeof(*m->buckets);
 	size_t max_pool_blocks = buckets * 2;
 	size_t pool_memory_size = max_pool_blocks * bucket_size;
@@ -904,7 +918,7 @@ struct HashMapClosedAddr {
 				if (current->hash == hash) {
 					if (current->key == k) {
 						current->value = v;
-						return &current->value;
+						return current->value;
 					}
 				}
 
@@ -921,7 +935,7 @@ struct HashMapClosedAddr {
 			current->key = k;
 			current->value = v;
 
-			return &current->value;
+			return current->value;
 		}
 	}
 
@@ -1058,7 +1072,7 @@ void hash_map_init(HashMapClosedAddr<K, V> *m, PoolAllocator *a, size_t buckets)
 template <MapKey K, typename V>
 void hash_map_init(HashMapClosedAddr<K, V> *m, Arena *a, size_t buckets) 
 {
-	auto p = (PoolAllocator *)arena_alloc(a, sizeof(PoolAllocator));
+	auto p = arena_alloc_struct(a, PoolAllocator);
 	size_t bucket_size = sizeof(*m->buckets);
 	size_t max_pool_blocks = buckets * 2;
 	size_t pool_memory_size = max_pool_blocks * bucket_size;
@@ -1072,5 +1086,7 @@ void hash_map_init(HashMapClosedAddr<K, V> *m, Arena *a, size_t buckets)
 		pool_alloc(p);
 	}
 }
+
+
 
 #define string_builder8_to_string(sb) String8{sb.content, sb.length}

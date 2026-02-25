@@ -13,15 +13,13 @@ void put_column_info_on_disk_schema_column(ColumnInfo *info, MemoryMappedFile *s
 {
 
 	auto padding_to_add = calculate_schema_padding_on_name_length(info->name.length);
-
-	auto bytes_to_write = sizeof(TableDictSchema) + info->name.length + padding_to_add + 1;
 	auto location_to_write = (TableDictSchema *)mmf_mapping_offset_ptr(schema_file, schema_file->filesize);
-	mmf_append(schema_file, 0, bytes_to_write);
-		
-	std::memset(location_to_write, 0, bytes_to_write); // set null terminator and padding on the struct
-	location_to_write->type = info->type;
-	location_to_write->name_length = info->name.length;
-	std::memcpy(location_to_write->column_name, info->name.content, info->name.length);
+  TableDictSchema schema{};
+	schema.type = info->type;
+	schema.name_length = info->name.length;
+	std::memcpy(schema.column_name, info->name.content, info->name.length);
+
+	mmf_append_struct(schema_file, &schema);
 
 	auto *header = (TableDictHeader *)schema_file->mapping;
 	header->number_of_columns++;
@@ -45,4 +43,431 @@ String8 create_table_dict_file_path_from_name(Arena *a,
 
 
 	return string_builder8_to_string(table_directory);
+}
+
+TableNameSlot *_get_table_name_slot_ptr(SchemaMaps *schema_maps, uint32_t index) 
+{
+		
+	auto *table_slots =
+		(TableNameSlot *)((uint8_t *)schema_maps->arena.memory + schema_maps->table_first_name_slot_offset);
+
+	return &table_slots[index];
+}
+
+TableSchemaSlot *_get_table_schema_slot_ptr(SchemaMaps *schema_maps, uint32_t index)
+{
+
+	TableSchemaSlot *table_slots =
+		(TableSchemaSlot *)((uint8_t *)schema_maps->arena.memory + schema_maps->table_first_schema_slot_offset);
+
+	return &table_slots[index];
+}
+
+ColumnSlot *_get_column_slot_ptr(SchemaMaps *schema_maps, TableID table_id, uint32_t index) 
+{
+	auto table_slot = _get_table_schema_slot_ptr(schema_maps, table_id.index);
+	ColumnSlot *column_slots = (ColumnSlot *)((uint8_t *)schema_maps->arena.memory + table_slot->schema.column_schema_offset);
+
+	if (index > table_slot->schema.max_columns) {
+		return 0;
+	}
+
+	return &column_slots[index];
+}
+
+template <typename T>
+ptrdiff_t arena_alloc_struct_array_and_get_offset_from_base(Arena *a, uint32_t array_length) 
+{
+	return (ptrdiff_t)((uint8_t *)arena_alloc_struct_array(a, T, array_length) - (uint8_t *)a->memory);
+}
+
+ColumnHashTableBucket *_get_table_column_hash_map(SchemaMaps *schema_maps, uint32_t index) 
+{
+
+	auto table_slot = _get_table_schema_slot_ptr(schema_maps, index);
+	return (ColumnHashTableBucket *)((uint8_t *)schema_maps->arena.memory +
+					 table_slot->schema.id_hash_table_offset);
+}
+
+void schema_maps_init(SchemaMaps *schema_maps, uint32_t table_capacity) {
+	*schema_maps = {};
+	auto maps_arena = &schema_maps->arena;
+	auto table_schema_maps_size =
+		table_capacity * (sizeof(SchemaTableMapBucket) + sizeof(TableSchema) + sizeof(TableNameSlot));
+  
+	auto column_arrays_size =
+		table_capacity * MAX_COLUMNS * (sizeof(ColumnHashTableBucket) + sizeof(ColumnSlot));
+
+	// Double it and give it the next person
+	auto arena_capacity = table_schema_maps_size + column_arrays_size * 2; 
+	arena_init(maps_arena, arena_capacity);
+	std::memset(maps_arena->memory, 0, arena_capacity);
+
+	schema_maps->table_id_map_first_bucket_offset =
+		arena_alloc_struct_array_and_get_offset_from_base<SchemaTableMapBucket>(maps_arena, table_capacity);
+	schema_maps->table_first_name_slot_offset =
+		arena_alloc_struct_array_and_get_offset_from_base<TableNameSlot>(maps_arena, table_capacity);
+	schema_maps->table_first_schema_slot_offset =
+		arena_alloc_struct_array_and_get_offset_from_base<TableSchemaSlot>(maps_arena, table_capacity);
+
+	schema_maps->table_capacity = table_capacity;
+
+
+	// TODO(Ray):
+	// Init pool allocator
+}
+
+ColumnID schema_maps_create_column(SchemaMaps *schema_maps, TableID id, StringSlice8 column_string,
+																	 ColumnDataType data_type)
+{
+	if (id.id == 0) {
+		return {};
+	}
+
+	auto table_slot = _get_table_schema_slot_ptr(schema_maps, id.index);
+	if (table_slot->generation != id.generation) {
+		return ColumnID{};
+	}
+
+	ColumnID result = {};
+	auto &table_schema = table_slot->schema;
+	ColumnSlot *column_slot = nullptr;
+
+  ++table_schema.version;
+	auto last_free_slot = table_schema.column_last_free_head;
+	if (last_free_slot) {
+		column_slot =_get_column_slot_ptr(schema_maps, id, last_free_slot);
+		result.index = last_free_slot;
+		result.generation = ++column_slot->generation;
+	} else {
+
+		auto desired_index = ++table_schema.column_count;
+		result.index = desired_index;
+		if (desired_index >= table_schema.max_columns) {
+      //TODO(Ray): Return an error if we reach max capacity 
+			result.fake_slot = 1;
+			return result;
+		}
+
+		column_slot = _get_column_slot_ptr(schema_maps, id, desired_index);
+	}
+
+	auto &column_schema = column_slot->schema;
+	column_schema.type = data_type;
+
+	auto hash_table_buckets = _get_table_column_hash_map(schema_maps, id.index);
+	auto hash = std::hash<StringSlice8>{}(column_string);
+	auto hash_table_index = hash % table_schema.max_columns * 2;
+	// TODO(Ray): Make safe lol
+	auto bucket = &hash_table_buckets[hash_table_index];
+	while (bucket->column_id.id != 0) {
+		++bucket;
+	}
+
+	bucket->column_id = result;
+	bucket->hash = hash;
+	bucket->name_length = column_string.length;
+	std::memcpy((void *)bucket->name, column_string.content, column_string.length);
+
+
+	return result;
+}
+
+//TODO(Ray) need to compute the column hash anyway so i want a function to get the id with the hash
+ColumnID schema_maps_lookup_column_id(SchemaMaps *schema_maps, TableID id, StringSlice8 column_string) 
+{
+	if (id.id == 0) {
+		return {};
+	}
+
+	auto hash_table_buckets = _get_table_column_hash_map(schema_maps, id.index);
+	auto table_slot = _get_table_schema_slot_ptr(schema_maps, id.index);
+
+	auto hash = std::hash<StringSlice8>{}(column_string);
+	auto hash_table_index = hash % table_slot->schema.max_columns * 2;
+	auto bucket = &hash_table_buckets[hash_table_index];
+	auto &table_schema = table_slot->schema;
+
+	auto column_slots = (ColumnSlot *)(uint8_t *)schema_maps->arena.memory + table_schema.column_schema_offset;
+	while (bucket->column_id.id != 0) {
+		if (bucket->hash == hash) {
+			if (StringSlice8{bucket->name, bucket->name_length} == column_string) {
+				return bucket->column_id;
+			}
+		}
+
+		++bucket;
+	}
+
+	return {};
+}
+
+ColumnDataType schema_maps_get_column_data_type(SchemaMaps *schema_maps, TableID table_id, ColumnID column_id) 
+{
+	auto column_slot = _get_column_slot_ptr(schema_maps, table_id, column_id.index);
+  return column_slot->schema.type;
+}
+
+SchemaTableMapBucket *_get_table_hash_map_first_bucket(SchemaMaps *schema_maps) 
+{
+	return (SchemaTableMapBucket *)((uint8_t *)schema_maps->arena.memory + schema_maps->table_id_map_first_bucket_offset);
+}
+
+TableID schema_maps_lookup_table_id(SchemaMaps *schema_maps, StringSlice8 table_string) 
+{
+	auto buckets = _get_table_hash_map_first_bucket(schema_maps);
+	auto hash = std::hash<StringSlice8>{}(table_string);
+	auto hash_table_index = hash % schema_maps->table_capacity;
+	auto bucket = &buckets[hash_table_index];
+
+	while (bucket->table_id.id != 0) {
+		if (bucket->hash == hash) {
+			auto name_ptr = _get_table_name_slot_ptr(schema_maps, bucket->table_id.index);
+			auto &schema_string = name_ptr->table_name;
+			if (StringSlice8{ schema_string.buffer, schema_string.length } == table_string) {
+				return bucket->table_id;
+			}
+		}
+
+		++bucket;
+	}
+
+	return {};
+}
+
+TableID schema_maps_create_table(SchemaMaps *schema_maps, StringSlice8 table_name)
+{
+	TableSchemaSlot *table_slot = nullptr;
+	auto last_free_slot = schema_maps->table_slot_free_head;
+	TableID result = {};
+
+	if (last_free_slot) {
+		table_slot = _get_table_schema_slot_ptr(schema_maps, last_free_slot);
+		table_slot->schema.column_count = 0;
+		result.index = last_free_slot;
+		result.generation = ++table_slot->generation;
+	} else { 
+		auto desired_index = ++schema_maps->table_count;
+		result.index = desired_index;
+		if (desired_index >= schema_maps->table_capacity) {
+      // TODO(Ray) REEEEEEEalloc
+		} else {
+			schema_maps->table_count++;
+
+			table_slot = _get_table_schema_slot_ptr(schema_maps, desired_index);
+			auto &schema = table_slot->schema;
+			schema = {};
+			uint8_t *base_addr = (uint8_t *)schema_maps->arena.memory;
+			schema.column_schema_offset =
+				(ptrdiff_t)((uint8_t *)arena_alloc_struct_array(&schema_maps->arena, ColumnSlot, MAX_COLUMNS) - base_addr);
+			schema.id_hash_table_offset =
+				(ptrdiff_t)((uint8_t *)arena_alloc_struct_array(&schema_maps->arena, ColumnHashTableBucket, MAX_COLUMNS * 2) -
+										base_addr);
+			schema.max_columns = MAX_COLUMNS;
+		}
+	}
+
+	auto table_map_buckets = _get_table_hash_map_first_bucket(schema_maps);
+	auto hash = std::hash<StringSlice8>{}(table_name);
+	auto hash_table_index = hash % schema_maps->table_capacity;
+
+	
+	// TODO(Ray): Make safe lol
+	auto bucket = &table_map_buckets[hash_table_index];
+	while (bucket->table_id.id != 0) {
+		++bucket;
+	}
+
+	bucket->table_id = result;
+	bucket->hash = hash;
+	auto name_slot_ptr = _get_table_name_slot_ptr(schema_maps, result.index);
+	auto &slot_name = name_slot_ptr->table_name;
+	slot_name.length = table_name.length;
+	std::memcpy((void *)slot_name.buffer, table_name.content, table_name.length);
+
+	return result;
+}
+
+TableSchema *schema_maps_lookup_table_schema_by_id(SchemaMaps *schema_maps, TableID id) 
+{
+	return &_get_table_schema_slot_ptr(schema_maps, id.index)->schema;
+}
+
+void schema_maps_delete_table(SchemaMaps *schema_maps, TableID id) 
+{
+	if (id.id == 0) {
+		return;
+	}
+
+	TableSchemaSlot *table_slots =
+		(TableSchemaSlot *)(uint8_t *)schema_maps->arena.memory + schema_maps->table_first_schema_slot_offset;
+
+	auto table_slot = &table_slots[id.index];
+
+	if (table_slot->generation != id.generation) {
+		return;	
+	}
+
+	table_slot->next_free_index = schema_maps->table_slot_free_head;
+	schema_maps->table_slot_free_head = id.index;
+}
+
+SchemaMaps *get_latest_schema_maps(SchemaCacheTrippleBuffer *maps) 
+{
+	return &maps->maps[maps->version_number % 3];
+}
+
+SchemaMapsResult get_latest_schema_maps_inc_refcount(SchemaCacheTrippleBuffer *maps)
+{
+	auto version_number = maps->version_number.load(std::memory_order_acquire);
+	auto index = version_number % 3;
+	auto refcount = maps->refcounts[index].fetch_add(1, std::memory_order_release);
+	return { &maps->maps[index], version_number };
+}
+
+void schema_maps_dec_refcount(SchemaCacheTrippleBuffer *maps, SchemaMapsResult maps_result)
+{
+	auto index = maps_result.version_number % 3;
+	maps->refcounts[index].fetch_sub(1, std::memory_order_acquire);
+}
+
+void thread_local_schema_maps_init(ThreadLocalSchemaMaps *schema_maps)
+{
+  *schema_maps = {};
+  auto arena = &schema_maps->arena;
+  auto table_page_map_size = MAX_TABLES * sizeof(RequestInfoAndPage);
+  auto table_pages_size = (DATA_PAGE_SIZE + sizeof(DataPage)) * TABLE_PAGE_LIMIT;
+  auto local_table_page_map_size = DEFAULT_TABLE_CAPACITY * (sizeof(LocalTablePageMapBucket) + sizeof(SchemaString));
+  auto table_request_info_size = TABLE_PAGE_LIMIT * sizeof(PerTableRequestInfo);
+
+  arena_init(arena, table_page_map_size + local_table_page_map_size + table_pages_size + table_request_info_size);
+
+  auto data_page_pool_memory = arena_alloc(arena, table_pages_size, 8);
+  auto request_info_pool_memory = arena_alloc_struct_array(arena, PerTableRequestInfo, TABLE_PAGE_LIMIT);
+	pool_init(&schema_maps->data_page_pool, sizeof(DataPage) + DATA_PAGE_SIZE, TABLE_PAGE_LIMIT, data_page_pool_memory, table_pages_size);
+	pool_init(&schema_maps->per_table_request_info_pool, sizeof(PerTableRequestInfo), TABLE_PAGE_LIMIT,
+						request_info_pool_memory, table_request_info_size);
+	schema_maps->table_page_map_array = arena_alloc_struct_array(arena, RequestInfoAndPage, MAX_TABLES);
+	schema_maps->local_table_page_map.buckets =
+		arena_alloc_struct_array(arena, LocalTablePageMapBucket, DEFAULT_TABLE_CAPACITY);
+	schema_maps->local_table_page_map.strings = arena_alloc_struct_array(arena, SchemaString, DEFAULT_TABLE_CAPACITY);
+  schema_maps->local_table_page_map.capacity = DEFAULT_TABLE_CAPACITY;
+
+}
+
+DataPage *schema_maps_get_new_page(ThreadLocalSchemaMaps *schema_maps) 
+{
+  auto data_page = (DataPage *)pool_alloc(&schema_maps->data_page_pool);
+  data_page->bytes_written = sizeof(DataPageHeader);
+	auto header = data_page->data; // zero the struct might be garbage in there
+  std::memset(header, 0, sizeof(DataPageHeader));
+  return data_page;
+}
+
+PerTableRequestInfo *schema_maps_get_new_request_info(ThreadLocalSchemaMaps *schema_maps) 
+{
+  auto request_info = (PerTableRequestInfo *)pool_alloc(&schema_maps->per_table_request_info_pool);
+  *request_info = {};
+  request_info->strings_arena.memory = request_info->arena_backing;
+  request_info->strings_arena.capacity = sizeof(request_info->arena_backing);
+
+  return request_info;
+}
+
+LocalTablePageMapValue *local_table_page_map_insert_new_page_and_info(ThreadLocalSchemaMaps *schema_maps, StringSlice8 table_name, TableID id) 
+{
+  auto new_page = schema_maps_get_new_page(schema_maps);
+	auto new_request_info = schema_maps_get_new_request_info(schema_maps);
+
+	auto &page_map = schema_maps->local_table_page_map;
+	auto hash = std::hash<StringSlice8>{}(table_name);
+	auto index = hash % page_map.capacity;
+	auto &bucket = page_map.buckets[index];
+
+	while (bucket.hash != 0) {
+		if (bucket.hash == hash) {
+			auto &string = page_map.strings[index];
+			if (StringSlice8{string.buffer, string.length} == table_name) {
+				break;
+			}
+		}
+
+		index = (index + 1) % page_map.capacity;
+		bucket = page_map.buckets[index];
+	}
+
+  bucket.hash = hash;
+
+	auto &string = page_map.strings[index];
+	string.length = table_name.length;
+	std::memcpy(string.buffer, table_name.content, table_name.length);
+	bucket.value.info_and_page.request_info = new_request_info;
+  bucket.value.info_and_page.current_page = new_page;
+  bucket.value.info_and_page.page_head = new_page;
+	bucket.value.table_id = id;
+  return &bucket.value;
+}
+
+LocalTablePageMapValue *local_table_page_map_lookup(ThreadLocalSchemaMaps *schema_maps, StringSlice8 table_name)
+{
+	auto &page_map = schema_maps->local_table_page_map;
+	auto hash = std::hash<StringSlice8>{}(table_name);
+	auto index = hash % page_map.capacity;
+	auto &bucket = page_map.buckets[index];
+
+	auto search_count = 0;
+	while (bucket.hash != 0) {
+		if (bucket.hash == hash) {
+			auto string = page_map.strings[index];
+			if (StringSlice8{string.buffer, string.length} == table_name) {
+				return &bucket.value;
+			}
+		}
+
+		if (search_count == page_map.capacity) {
+			return {};
+		}
+
+		index = (index + 1) % page_map.capacity;
+		bucket = page_map.buckets[index];
+	}
+
+	return {};
+}
+
+RequestInfoAndPage *table_page_map_lookup(ThreadLocalSchemaMaps *schema_maps, TableID id) 
+{
+  return &schema_maps->table_page_map_array[id.index];
+}
+
+RequestInfoAndPage *table_page_map_insert_new_page_and_info(ThreadLocalSchemaMaps *schema_maps, TableID id)
+{
+
+
+  auto &slot = schema_maps->table_page_map_array[id.index];
+
+  auto new_page = schema_maps_get_new_page(schema_maps);
+	slot.request_info = schema_maps_get_new_request_info(schema_maps);
+  slot.current_page = new_page;
+  slot.page_head = new_page;
+
+  return &slot;
+}
+
+uint32_t get_data_size_from_col_type(ColumnDataType type)
+{
+	switch (type) {
+	case ColumnDataType::DOUBLE:
+	case ColumnDataType::INT64:
+		return 8;
+
+	case ColumnDataType::FLOAT:
+	case ColumnDataType::INT32:
+		return 4;
+
+	case ColumnDataType::VARCHAR:
+		return 255;
+	default:
+		return 0;
+	}
 }

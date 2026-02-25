@@ -7,8 +7,6 @@
 #elif defined(_M_ARM64) || defined(__aarch64__)
 #define cpu_pause() __asm__ __volatile__("yield")
 #endif
-#define max(a, b) (a) < (b) ? (a) : (b)
-#define min(a, b) (a) > (b) ? (a) : (b)
 
 enum class MMFileAccess {
 	NONE,
@@ -31,7 +29,7 @@ struct MemoryMappedFile {
 
 bool create_directory(const char *path);
 FileHandle create_file(const char *path);
-void memory_map_file_handle_read_only(MemoryMappedFile *mmf, FileHandle handle);
+void memory_map_file_handle_read_only(MemoryMappedFile *mmf, FileHandle handle, uint64_t filesize);
 void memory_map_entire_file_read_only(MemoryMappedFile *mmf, const char *filepath);
 void memory_map_file_handle_append(MemoryMappedFile *mmf, FileHandle handle, uint64_t append_size);
 void memory_map_entire_file_append(MemoryMappedFile *mmf, const char *filepath, uint64_t append_size);
@@ -39,8 +37,8 @@ void *mmf_mapping_offset_ptr(MemoryMappedFile *mmf, uint64_t offset);
 void unmap_file(MemoryMappedFile *mmf);
 void mmf_write(MemoryMappedFile *mmf, uint64_t offset, char *data, uint64_t data_size);
 void mmf_append(MemoryMappedFile *mmf, void *data, uint64_t data_size);
-
-
+uint64_t platform_get_high_res_timer_stamp();
+uint64_t platform_high_res_timer_freq();
 
 #define atomic_fetch_add_s64_rlxd
 #define atomic_fetch_add_s64_acq

@@ -11,8 +11,12 @@ void mpmc_work_queue_init(MPMCWorkQueue *wq, Arena *a, uint32_t work_capacity,
 {
 	memset(wq, 0, sizeof(MPMCWorkQueue));
 	wq->capacity = work_capacity;
-	wq->entries = (MPMCWorkQueueEntry *)arena_alloc(
-		a, sizeof(*wq->entries) * work_capacity);
+	wq->entries = arena_alloc_struct_array(a, MPMCWorkQueueEntry, work_capacity);
+
+  for (int i = 0; i < wq->capacity; ++i) {
+    wq->entries[i].seq_num = i;
+  }
+
 }
 
 void mpmc_work_queue_dequeue_entry(ThreadContext *t_ctx, MPMCWorkQueue *wq)

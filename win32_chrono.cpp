@@ -86,7 +86,7 @@
 #endif
 
 #define PACKED_STRUCT_START __pragma(pack(push, 1))
-#define PACKED_STRUCT_END __pragma(pack, pop)
+#define PACKED_STRUCT_END __pragma(pack(pop))
 
 
 size_t get_filesize(const char *path) {
@@ -132,16 +132,13 @@ int read_entire_file(const char *path, void *buffer, size_t buffer_size) {
 	return success ? result : 0;
 }
 
-void memory_map_file_handle_read_only(MemoryMappedFile *mmf, FileHandle handle) 
+void memory_map_file_handle_read_only(MemoryMappedFile *mmf, FileHandle handle, uint64_t filesize) 
 {
 	HANDLE fh = handle.os_handle;
-	// get file size
-	LARGE_INTEGER file_size = {};
-	GetFileSizeEx(fh, &file_size);
 
 	HANDLE mapping_handle =
-		CreateFileMappingA(fh, NULL, PAGE_READWRITE,
-				   file_size.HighPart, file_size.LowPart, NULL);
+		CreateFileMappingA(fh, NULL, PAGE_READONLY,
+				   filesize >> 32, filesize & 0x00000000FFFFFFFF, NULL);
 
 
 	if (mapping_handle == NULL) {
@@ -158,7 +155,7 @@ void memory_map_file_handle_read_only(MemoryMappedFile *mmf, FileHandle handle)
 	CloseHandle(mapping_handle);
 	CloseHandle(fh);
 
-	uint64_t mapping_size = *(uint64_t *)(&file_size.QuadPart);
+	uint64_t mapping_size = *(uint64_t *)(&filesize);
 	*mmf = MemoryMappedFile{handle, file_memory, mapping_size, mapping_size, MMFileAccess::READ};
 }
 
@@ -177,7 +174,7 @@ void memory_map_entire_file_read_only(MemoryMappedFile *mmf, const char *filepat
 		return; 
 	}
 
-	memory_map_file_handle_read_only(mmf, FileHandle{fh});
+	memory_map_file_handle_read_only(mmf, FileHandle{fh}, 0);
 }
 
 
@@ -275,3 +272,16 @@ void mmf_append(MemoryMappedFile *mmf, void *data, uint64_t data_size)
 	}
 }
 
+uint64_t platform_get_high_res_timer_stamp() 
+{
+  LARGE_INTEGER timestamp;
+  QueryPerformanceCounter(&timestamp);
+  return timestamp.QuadPart;
+}
+
+uint64_t platform_high_res_timer_freq()
+{
+  LARGE_INTEGER freq;
+  QueryPerformanceFrequency(&freq);
+  return freq.QuadPart;
+}
