@@ -189,9 +189,6 @@ int main(int argc, char *argv[])
 		auto &thread_context = thread_context_array[thread_idx];
     thread_context.thread_id = thread_idx;
 		arena_init(&thread_context.transient_arena, MEGABYTES(32));
-    if ((uintptr_t)&thread_context.schema_maps == (uintptr_t)-1) {
-      __debugbreak();
-    }
     thread_local_schema_maps_init(&thread_context.schema_maps);
 	}
 
@@ -229,29 +226,15 @@ int main(int argc, char *argv[])
 	}
 
 	// read entire file
-	FILE *fd;
-	fopen_s(&fd, "outfile.data", "rb");
-	if (fd == NULL) {
-		perror("can't open file");
-	}
-
-	// compute filesize
-	fseek(fd, 0, SEEK_END);
-	uint64_t filesize = ftell(fd);
-	fseek(fd, 0, SEEK_SET);
-
+	auto filesize = get_filesize("outfile.data");
 	char *buffer = (char *)arena_alloc(&main_arena, filesize + 1);
-	size_t bytes_read = fread(buffer, 1, filesize, fd);
-
-	assert(bytes_read == filesize);
-
-	fclose(fd);
-
+	size_t bytes_read = read_entire_file("outfile.data", buffer, filesize);
 	buffer[filesize] = 0; // null terminator
 	uint64_t string_size = filesize;
 
   double thread_time_acc[2] = {};
   double submission_time_acc = 0;
+
   for (int i = 0; i < 100; ++i) {
 		mpmc_begin_producer(&io_queue);
 

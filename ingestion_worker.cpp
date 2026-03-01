@@ -7,6 +7,29 @@
 #include "metadata.h"
 #include "ingestion_worker.h"
 
+
+#if defined (__APPLE__)
+#include <stdlib.h>
+#include <xlocale.h>
+
+inline bool parse_double(char* str, char* end_ptr, double* out_value) {
+    // Cache the C locale globally to avoid reallocation overhead
+    static locale_t c_locale = newlocale(LC_ALL_MASK, "C", NULL);
+    
+    *out_value = strtod_l(str, &end_ptr, c_locale);
+    
+    // Returns true if parsing advanced the pointer
+    return (end_ptr != str);
+}
+
+#else
+inline bool parse_double(const char *str, char *end_ptr, double *out_value)
+{
+	auto parsing_res = std::from_chars((char *)str, (char *)end_ptr, out_value);
+	return parsing_res.ec == std::errc::invalid_argument;
+}
+#endif
+
 bool string_sort_cmp(StringSlice8 a, StringSlice8 b)
 {
 	if (a.content == 0) {
@@ -36,6 +59,7 @@ bool string_sort_cmp(StringSlice8 a, StringSlice8 b)
 
 	return true;
 }
+
 
 ParseValueResult parse_string(StringSlice8 string)
 {
@@ -71,13 +95,13 @@ ParseValueResult parse_value(StringSlice8 value)
 		auto parsing_res = std::from_chars((char *)value.content, (char *)value.content + value.length, result.data.int64);
 
 		if (parsing_res.ec == std::errc::invalid_argument) {
-			auto parsing_res = std::from_chars((char *)value.content, (char *)value.content + value.length, result.data.dbl);
-
-			result.type = ColumnDataType::DOUBLE;
-			if (parsing_res.ec == std::errc::invalid_argument) {
-				result.type = ColumnDataType::INVALID;
+      if (parse_double((char *)value.content, (char *)value.content + value.length, &result.data.dbl)) {
+        result.type = ColumnDataType::INVALID;
+			} else {
 				result.err_msg = string8_from_cstring("Error parsing column value as int or float");
-			}
+      }
+
+
 		}
 	} else {
 		result = parse_string(value);

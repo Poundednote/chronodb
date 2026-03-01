@@ -29,6 +29,8 @@ struct MemoryMappedFile {
 
 bool create_directory(const char *path);
 FileHandle create_file(const char *path);
+size_t get_filesize(const char *path);
+int read_entire_file(const char *path, void *buffer, size_t buffer_size);
 void memory_map_file_handle_read_only(MemoryMappedFile *mmf, FileHandle handle, uint64_t filesize);
 void memory_map_entire_file_read_only(MemoryMappedFile *mmf, const char *filepath);
 void memory_map_file_handle_append(MemoryMappedFile *mmf, FileHandle handle, uint64_t append_size);

@@ -1,3 +1,4 @@
+#pragma once
 
 #include "metadata.h"
 #include "writer.h"

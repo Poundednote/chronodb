@@ -784,7 +784,7 @@ struct ThreadSafeMap {
 	void erase(const K &k)
 	{
 		auto hash = std::hash<K>{}(k);
-		auto idx = hash % this.bucket_count;
+		auto idx = hash % this->bucket_count;
 
 		ThreadSafeMapBucket<K, V> &bucket = this->buckets[idx];
 		std::unique_lock<std::shared_mutex> lock{bucket.lock};
@@ -979,7 +979,7 @@ HashMapClosedAddrInsertOrGetResult<V> insert_or_get(const K &k, const V &v)
 	void erase(const K &k)
 	{
 		auto hash = std::hash<K>{}(k);
-		auto idx = hash % this.bucket_count;
+		auto idx = hash % this->bucket_count;
 
 		HashMapBucket<K, V> &bucket = this->buckets[idx];
 
