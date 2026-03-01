@@ -6,8 +6,7 @@
 
 #define WQ_TASK(name, ...) void *name(ThreadContext *t_ctx, void *args)
 
-void mpmc_work_queue_init(MPMCWorkQueue *wq, Arena *a, uint32_t work_capacity,
-			  uint64_t thread_arena_capacity)
+void mpmc_work_queue_init(MPMCWorkQueue *wq, Arena *a, uint32_t work_capacity)
 {
 	memset(wq, 0, sizeof(MPMCWorkQueue));
 	wq->capacity = work_capacity;
@@ -112,51 +111,24 @@ void mpmc_work_queue_stop(MPMCWorkQueue *wq)
         wq->tail.notify_all();
 }
 
-void mpsc_writer_enqueue(MPSCWriterQueue *wq, void *data) 
+void mpsc_writer_init(MPSCWriterQueue *wq, Arena *a, uint32_t work_capacity)
+{
+	memset(wq, 0, sizeof(MPMCWorkQueue));
+	wq->capacity = work_capacity;
+	wq->entries = arena_alloc_struct_array(a, MPSCWriterQueueEntry, work_capacity);
+}
+
+void mpsc_writer_enqueue(MPSCWriterQueue *wq, MPSCWriterQueueEntry entry)
 {
 	uint64_t tail = wq->tail.load(std::memory_order_relaxed);
-	uint64_t head = wq->head.load(std::memory_order_relaxed);
 	uint64_t next_tail_index = tail + 1;
 	uint64_t mask = wq->capacity - 1;
 
 	for (;;) {
-		if ((tail - head) < wq->capacity) {
-			if (wq->tail.compare_exchange_weak(tail, next_tail_index, std::memory_order_relaxed,
-							   std::memory_order_relaxed)) {
-				MPSCWriteQueueEntry *wq_entry = &wq->entries[tail & mask];
-
-				while (wq_entry->seq_num.load(std::memory_order_acquire) != tail) {
-					cpu_pause();
-				}
-
-				wq_entry->data = data;
-				wq_entry->seq_num.store(tail + 1, std::memory_order_release);
-				wq->tail.notify_all();
-				break;
-			}
-		} else {
-			cpu_pause();
+		if (wq->tail.compare_exchange_weak(tail, next_tail_index, std::memory_order_acquire, std::memory_order_relaxed)) {
+			wq->entries[tail & mask] = entry;
+			wq->tail.notify_all();
+			break;
 		}
-	}
-}
-
-void mpsc_writer_dequeue(MPSCWriterQueue *wq, void *data) 
-{
-	uint64_t head = wq->head.load(std::memory_order_relaxed);
-	uint64_t mask = wq->capacity - 1;
-	auto tail = wq->tail.load(std::memory_order_relaxed);
-
-	if (head < tail) {
-		auto wq_entry = &wq->entries[head & mask];
-		wq->head.fetch_add(1, std::memory_order_relaxed);
-		while (wq_entry->seq_num.load(std::memory_order_acquire) != head + 1) {
-			cpu_pause();
-		}
-
-		// do something with payload
-		//
-		wq_entry->seq_num.store(head + wq->capacity, std::memory_order_release);
-	} else {
-		wq->tail.wait(tail);
 	}
 }

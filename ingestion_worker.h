@@ -2,6 +2,7 @@
 
 #include "utils.h"
 #include "metadata.h"
+#include "context.h"
 
 struct Tokeniser {
   char *at;

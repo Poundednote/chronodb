@@ -18,6 +18,8 @@
 #include "utils.h"
 #include "chrono_platform.h"
 
+struct DatabaseContext;
+
 #define MAX_TAGS (256)
 #define MAX_TABLE_NAME_SIZE (256u)
 #define MAX_PATH_SIZE (1024u)
@@ -355,8 +357,6 @@ struct DataPage {
 };
 
 struct RequestInfoAndPage {
-  uint64_t start_timestamp;
-  uint64_t end_timestamp;
   PerTableRequestInfo *request_info;
   DataPage *page_head;
   DataPage *current_page;
@@ -445,25 +445,6 @@ struct SchemaCacheTrippleBuffer {
 	std::atomic<uint64_t> version_number;
 	std::atomic<uint32_t> refcounts[3];
 	SchemaMaps maps[3];
-};
-
-struct ThreadContext {
-	uint16_t thread_id;
-	Arena transient_arena;
-	ThreadLocalSchemaMaps schema_maps;
-  double ms_time_taken;
-};
-
-struct DatabaseContext {
-	String8 db_name;
-	ThreadContext *thread_context_array;
-	uint16_t thread_count;
-
-	MemoryMappedFile data_dict_file;
-
-	ThreadSafeMap<TableID, MemoryMappedFile> table_meta_file_map;
-	PoolAllocator schema_maps_pool;
-	SchemaCacheTrippleBuffer schema_maps_tripple_buffer;
 };
 
 struct SchemaMapsResult {

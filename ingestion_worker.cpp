@@ -5,7 +5,6 @@
 
 #include "utils.h"
 #include "metadata.h"
-
 #include "ingestion_worker.h"
 
 bool string_sort_cmp(StringSlice8 a, StringSlice8 b)
@@ -558,7 +557,7 @@ void *process_write_request(ThreadContext *t_ctx, DatabaseContext *context, Stri
 
 	schema_maps_dec_refcount(&context->schema_maps_tripple_buffer, schema_maps_result);
 	arena_clear(&t_ctx->transient_arena);
-
+  
 	auto time_end = platform_get_high_res_timer_stamp();
 	double ms_time_taken = ((double)(time_end - time_start) / (double)platform_high_res_timer_freq()) * 1000;
   t_ctx->ms_time_taken = ms_time_taken;

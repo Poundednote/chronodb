@@ -27,7 +27,6 @@ elif filetype == "exist":
                 line = f"table0 {i} [] testcolumn0={random.randint(0, 999)}, newcol={random.randint(0, 999)}\n"
             file_handler.write(line)
 
-
 elif filetype == "o3":
     with open("outfile.data", "w") as file_handler:
         for i in range(n_rows):

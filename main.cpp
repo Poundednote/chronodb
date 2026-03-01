@@ -25,9 +25,11 @@
 #include "chrono_platform.cpp"
 
 #include "utils.h"
+#include "context.h"
 #include "metadata.cpp"
 #include "workqueue.cpp"
 #include "ingestion_worker.cpp"
+#include "writer.cpp"
 
 #define TEST_DATABASE_NAME "TEST_DB"
 #define NANOSECONDS_IN_NS(n) (n)
@@ -46,7 +48,7 @@ void mpmc_work_queue_thread_start_routine(ThreadContext *t_ctx, uint16_t thread_
 {
 	t_ctx->thread_id = thread_id;
 
-	while (!wq->stop_flag.load(std::memory_order_acquire)) {
+	while (!wq->stop_flag.load(std::memory_order::acquire)) {
 		mpmc_work_queue_dequeue_entry(t_ctx, wq);
 	}
 }
@@ -141,10 +143,13 @@ int main(int argc, char *argv[])
 	arena_init(&main_arena, GIGABYTES(2));
 
 	DatabaseContext *db_context = arena_alloc_struct(&main_arena, DatabaseContext);
-
 	// init maps
 	auto schema_maps_buffer = &db_context->schema_maps_tripple_buffer;
 	auto table_meta_file_map = &db_context->table_meta_file_map;
+
+  for (auto &queue: db_context->writer_queues.queue_arr) {
+    mpsc_writer_init(&queue, &main_arena, 64);
+  }
 
 	if (argc >= 2) {
 		db_context->db_name = string8_from_cstring(argv[1]);
@@ -217,7 +222,7 @@ int main(int argc, char *argv[])
 	}
 
 	MPMCWorkQueue io_queue = {};
-	mpmc_work_queue_init(&io_queue, &main_arena, 512, MEGABYTES(1));
+	mpmc_work_queue_init(&io_queue, &main_arena, 512);
 
 	for (int i = 0; i < thread_count; ++i) {
 		new (io_threads + i) std::thread(mpmc_work_queue_thread_start_routine, thread_context_array + i, i, &io_queue);

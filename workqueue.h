@@ -1,19 +1,13 @@
 #pragma once
 
-#if defined(__APPLE__) && (defined(_M_ARM64) || defined(__aarch64__))
-#define CACHE_LINE_SIZE 128
-#elif defined(_M_x64) || defined(__x86_64__)
-#define CACHE_LINE_SIZE 64
-#elif defined(_WIN32) || defined(_WIN64)
-#define CACHE_LINE_SIZE 64
-#endif
-
 #include <stdint.h>
 #include <atomic>
 #include <thread>
 
 #include "utils.h"
 #include "metadata.h"
+
+#define WRITER_QUEUE_SIZE (64u)
 
 struct ThreadContext;
 typedef void *(WorkQueueFunc)(ThreadContext *, void *);
@@ -42,7 +36,7 @@ struct alignas(std::hardware_destructive_interference_size) MPMCWorkQueue {
 	std::atomic<bool32_t> stop_flag;
 };
 
-struct MPSCWriteQueueEntry {
+struct MPSCWriterQueueEntry {
 	SchemaString table_name;
   TableID table_id;
   RequestInfoAndPage request_info_and_page; 
@@ -50,9 +44,8 @@ struct MPSCWriteQueueEntry {
 };
 
 struct alignas(std::hardware_destructive_interference_size) MPSCWriterQueue {
-	MPSCWriteQueueEntry *entries;
+	MPSCWriterQueueEntry *entries;
 	uint64_t capacity;
-	alignas(std::hardware_destructive_interference_size) std::atomic<uint64_t> head;
 	alignas(std::hardware_destructive_interference_size) std::atomic<uint64_t> tail;
 };
 
@@ -63,3 +56,5 @@ void mpmc_work_queue_dequeue_entry(void *ctx, MPMCWorkQueue *wq);
 void inline mpmc_work_queue_start_work(MPMCWorkQueue *wq);
 void mpmc_work_queue_spinlock_till_finished(MPMCWorkQueue *wq);
 void mpmc_work_queue_stop(MPMCWorkQueue *wq);
+void mpsc_writer_init(MPSCWriterQueue *wq, Arena *a, uint32_t work_capacity);
+void mpsc_writer_enqueue(MPSCWriterQueue *wq, MPSCWriterQueueEntry entry);
