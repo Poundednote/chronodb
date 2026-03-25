@@ -9,8 +9,8 @@
 
 #define WRITER_QUEUE_SIZE (64u)
 
-struct ThreadContext;
-typedef void *(WorkQueueFunc)(ThreadContext *, void *);
+struct IngestionWorkerContext;
+typedef void *(WorkQueueFunc)(IngestionWorkerContext *, void *);
 typedef uint32_t bool32_t;
 
 struct MPMCWorkQueuePayload {
@@ -37,7 +37,6 @@ struct alignas(std::hardware_destructive_interference_size) MPMCWorkQueue {
 };
 
 struct MPSCWriterQueueEntry {
-	SchemaString table_name;
   TableID table_id;
   RequestInfoAndPage request_info_and_page; 
   uint16_t thread_id;
@@ -47,6 +46,7 @@ struct alignas(std::hardware_destructive_interference_size) MPSCWriterQueue {
 	MPSCWriterQueueEntry *entries;
 	uint64_t capacity;
 	alignas(std::hardware_destructive_interference_size) std::atomic<uint64_t> tail;
+	alignas(std::hardware_destructive_interference_size) std::atomic<uint64_t> head;
 };
 
 void mpmc_work_queue_enqueue_entry(MPMCWorkQueue *wq, MPMCWorkQueueEntry entry);

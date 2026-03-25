@@ -15,7 +15,7 @@
 #include <string>
 #include <algorithm>
 
-#include "chrono_platform.h"
+#include "chrono_platform.cpp"
 
 #define DEFAULT_ARENA_SIZE (4096)
 
@@ -121,6 +121,7 @@ void *arena_alloc_zero(Arena *a, uint64_t size, uint64_t alignment)
 
 struct PoolAllocatorFreeListNode {
 	PoolAllocatorFreeListNode *next;
+  uint64_t sig;
 };
 
 struct PoolAllocator {
@@ -153,6 +154,13 @@ void pool_init(PoolAllocator *p, size_t block_size, size_t block_count) {
 	pool_init(p, block_size, block_count, memory, memory_size);
 }
 
+void pool_init(PoolAllocator *p, Arena *a, size_t block_size, size_t block_count) {
+	size_t memory_size = block_size * block_count;
+	assert((memory_size) <= a->capacity - a->size);
+	auto memory = arena_alloc(a, memory_size);
+  pool_init(p, block_size, block_count, memory, memory_size);
+}
+
 void *pool_alloc(PoolAllocator *p)
 {
 	if (!p->head)
@@ -167,20 +175,27 @@ void *pool_alloc(PoolAllocator *p)
 
 void *pool_atomic_alloc(PoolAllocator *p) {
 
-	int64_t block[2] = {};
+  /* NOTE(Ray)
+    * The compiler only requires 8 bit alignment for these array fields, but cmpxchng16b requires 
+    * 16 byte alignment so need to manually align
+  */
+
+	alignas(16) uint64_t block[2] = {};
 	// need to make sure we do an atomic 128 load of both values 
-	atomic_compare_and_swap_128_rlxd(p->head, 0,  0, block);
+	atomic_compare_and_swap_128_rlxd(&p->head, 0,  0, block);
 	for (;;) {
 		PoolAllocatorFreeListNode* node_ptr = reinterpret_cast<PoolAllocatorFreeListNode*>(block[0]);
 		if (!node_ptr) {
+      __debugbreak();
 			return nullptr;
 		}
 
-		int64_t next_head[2];
-		next_head[0] = reinterpret_cast<int64_t>(node_ptr->next);
+		alignas(16) uint64_t next_head[2];
+		next_head[0] = reinterpret_cast<uint64_t>(node_ptr->next);
+    node_ptr->sig = 0xFEFEFEFE;
 		next_head[1] = block[1] + 1;
 
-		if (atomic_compare_and_swap_128_acq(p->head, next_head[1], next_head[0], block)) {
+		if (atomic_compare_and_swap_128_acq(&p->head, next_head[1], next_head[0], block)) {
 			return node_ptr; 
 		} else {
 			cpu_pause();
@@ -195,19 +210,20 @@ void pool_dealloc(PoolAllocator *p, void *ptr)
 	p->head = block;
 }
 
-void pool_atomic_dealloc(PoolAllocator *p, void *ptr) {
+__declspec(noinline) void pool_atomic_dealloc(PoolAllocator *p, void *ptr) {
 	auto node_to_free = reinterpret_cast<PoolAllocatorFreeListNode*>(ptr);
 
-	int64_t expected_head[2] = {};
-	atomic_compare_and_swap_128_rlxd(p->head, 0,  0, expected_head);
+	alignas(16) uint64_t expected_head[2] = {};
+	atomic_compare_and_swap_128_rlxd(&p->head, 0,  0, expected_head);
 	for (;;) {
 		node_to_free->next = reinterpret_cast<PoolAllocatorFreeListNode*>(expected_head[0]);
-		int64_t block[2];
-		block[0] = reinterpret_cast<int64_t>(ptr);
+
+		alignas(16) uint64_t block[2];
+		block[0] = reinterpret_cast<uint64_t>(ptr);
 		block[1] = expected_head[1] + 1;
 
-		if (atomic_compare_and_swap_128_rel(&p->head, block[0],
-						    block[1], expected_head)) {
+		if (atomic_compare_and_swap_128_rel(&p->head, block[1],
+						    block[0], expected_head)) {
 			return;
 		}
 	}

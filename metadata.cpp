@@ -1,7 +1,6 @@
 #include "chrono_platform.h"
 #include "metadata.h"
 
-
 inline int calculate_schema_padding_on_name_length(int64_t name_length) 
 {
 	// add 5 because we need to add an extra 4 to get the required byte padding for multiple of 4 but we also
@@ -23,26 +22,6 @@ void put_column_info_on_disk_schema_column(ColumnInfo *info, MemoryMappedFile *s
 
 	auto *header = (TableDictHeader *)schema_file->mapping;
 	header->number_of_columns++;
-}
-
-String8 create_table_dict_file_path_from_name(Arena *a,
-					      DatabaseContext *context,
-					      StringSlice8 table_name)
-{
-	StringBuilder8 table_directory;
-	uint32_t table_file_path_length = context->db_name.length + 1 +
-					  table_name.length + 1 +
-					  sizeof("/tables/dict.data") - 1;
-
-	string_builder8_init(a, &table_directory, table_file_path_length + 1);
-	string_builder8_append(&table_directory, context->db_name);
-	string_builder8_append(&table_directory,
-			       string8_from_cstring("/tables/"));
-	string_builder8_append(&table_directory, table_name);
-	string_builder8_append(&table_directory, string8_from_cstring("/dict.data"));
-
-
-	return string_builder8_to_string(table_directory);
 }
 
 TableNameSlot *_get_table_name_slot_ptr(SchemaMaps *schema_maps, uint32_t index) 
@@ -202,9 +181,61 @@ ColumnID schema_maps_lookup_column_id(SchemaMaps *schema_maps, TableID id, Strin
 	return {};
 }
 
+ColumnID schema_maps_lookup_column_id(SchemaMaps *schema_maps, TableID id, StringSlice8 column_string, uint64_t hash) 
+{
+	if (id.id == 0) {
+		return {};
+	}
+
+	auto hash_table_buckets = _get_table_column_hash_map(schema_maps, id.index);
+	auto table_slot = _get_table_schema_slot_ptr(schema_maps, id.index);
+
+	auto hash_table_index = hash % table_slot->schema.max_columns * 2;
+	auto bucket = &hash_table_buckets[hash_table_index];
+	auto &table_schema = table_slot->schema;
+
+	auto column_slots = (ColumnSlot *)(uint8_t *)schema_maps->arena.memory + table_schema.column_schema_offset;
+	while (bucket->column_id.id != 0) {
+		if (bucket->hash == hash) {
+			if (StringSlice8{bucket->name, bucket->name_length} == column_string) {
+				return bucket->column_id;
+			}
+		}
+
+		++bucket;
+	}
+
+	return {};
+}
+
+bool schema_maps_check_column_id_exists(SchemaMaps *schema_maps, TableID table_id, ColumnID column_id) 
+{
+
+  auto column_slot = _get_column_slot_ptr(schema_maps, table_id, column_id.index);
+  if (!column_slot) {
+    return false;
+  }
+
+  return column_slot->generation == column_id.generation;
+}
+
+bool schema_maps_check_table_id_exists(SchemaMaps *schema_maps, TableID table_id) 
+{
+  if (table_id.index >= schema_maps->table_count) {
+    return false;
+  }
+
+  auto table_slot = _get_table_schema_slot_ptr(schema_maps, table_id.index);
+  return table_slot->generation == table_id.generation;
+}
+
 ColumnDataType schema_maps_get_column_data_type(SchemaMaps *schema_maps, TableID table_id, ColumnID column_id) 
 {
 	auto column_slot = _get_column_slot_ptr(schema_maps, table_id, column_id.index);
+  if (!column_slot || column_slot->generation != column_id.generation) {
+    return ColumnDataType::INVALID;
+  }
+
   return column_slot->schema.type;
 }
 
@@ -312,9 +343,15 @@ void schema_maps_delete_table(SchemaMaps *schema_maps, TableID id)
 	schema_maps->table_slot_free_head = id.index;
 }
 
+
 SchemaMaps *get_latest_schema_maps(SchemaCacheTrippleBuffer *maps) 
 {
 	return &maps->maps[maps->version_number % 3];
+}
+
+SchemaMaps *_get_map_at_version(SchemaCacheTrippleBuffer *maps, uint64_t version)
+{
+  return &maps->maps[version % 3];
 }
 
 SchemaMapsResult get_latest_schema_maps_inc_refcount(SchemaCacheTrippleBuffer *maps)
@@ -335,38 +372,38 @@ void thread_local_schema_maps_init(ThreadLocalSchemaMaps *schema_maps)
 {
   *schema_maps = {};
   auto arena = &schema_maps->arena;
-  auto table_page_map_size = MAX_TABLES * sizeof(RequestInfoAndPage);
-  auto table_pages_size = (DATA_PAGE_SIZE + sizeof(DataPage)) * TABLE_PAGE_LIMIT;
-  auto local_table_page_map_size = DEFAULT_TABLE_CAPACITY * (sizeof(LocalTablePageMapBucket) + sizeof(SchemaString));
-  auto table_request_info_size = TABLE_PAGE_LIMIT * sizeof(PerTableRequestInfo);
 
-  arena_init(arena, table_page_map_size + local_table_page_map_size + table_pages_size + table_request_info_size);
+	arena_init(arena, TABLE_PAGE_MAP_SIZE + LOCAL_TABLE_PAGE_MAP_SIZE + TABLE_PAGES_SIZE + TABLE_REQUEST_INFO_SIZE +
+											ACTIVE_GLOBAL_TABLE_PAGES_SIZE);
 
-  auto data_page_pool_memory = arena_alloc(arena, table_pages_size, 8);
-  auto request_info_pool_memory = arena_alloc_struct_array(arena, PerTableRequestInfo, TABLE_PAGE_LIMIT);
-	pool_init(&schema_maps->data_page_pool, sizeof(DataPage) + DATA_PAGE_SIZE, TABLE_PAGE_LIMIT, data_page_pool_memory, table_pages_size);
-	pool_init(&schema_maps->per_table_request_info_pool, sizeof(PerTableRequestInfo), TABLE_PAGE_LIMIT,
-						request_info_pool_memory, table_request_info_size);
+	pool_init(&schema_maps->data_page_pool, arena, DATA_PAGE_SIZE, TABLE_PAGE_LIMIT);
+	pool_init(&schema_maps->per_table_request_info_pool, arena, sizeof(PerTableRequestInfo), TABLE_PAGE_LIMIT);
+  pool_init(&schema_maps->data_page_and_metadata_pool, arena, sizeof(DataPageAndMetadata), TABLE_PAGE_LIMIT);
+
+	schema_maps->active_global_table_pages = arena_alloc_struct_array(arena, TableID, TABLE_PAGE_LIMIT);
 	schema_maps->table_page_map_array = arena_alloc_struct_array(arena, RequestInfoAndPage, MAX_TABLES);
 	schema_maps->local_table_page_map.buckets =
 		arena_alloc_struct_array(arena, LocalTablePageMapBucket, DEFAULT_TABLE_CAPACITY);
 	schema_maps->local_table_page_map.strings = arena_alloc_struct_array(arena, SchemaString, DEFAULT_TABLE_CAPACITY);
+  schema_maps->local_table_page_map.info_and_page_arr = arena_alloc_struct_array(arena, RequestInfoAndPage, DEFAULT_TABLE_CAPACITY);
   schema_maps->local_table_page_map.capacity = DEFAULT_TABLE_CAPACITY;
 
 }
 
-DataPage *schema_maps_get_new_page(ThreadLocalSchemaMaps *schema_maps) 
+DataPageAndMetadata *schema_maps_get_new_page_and_metadata(ThreadLocalSchemaMaps *schema_maps) 
 {
-  auto data_page = (DataPage *)pool_alloc(&schema_maps->data_page_pool);
-  data_page->bytes_written = sizeof(DataPageHeader);
-	auto header = data_page->data; // zero the struct might be garbage in there
-  std::memset(header, 0, sizeof(DataPageHeader));
-  return data_page;
+  auto data_page = (DataPage *)pool_atomic_alloc(&schema_maps->data_page_pool);
+  auto page_and_metadata = (DataPageAndMetadata *)pool_atomic_alloc(&schema_maps->data_page_and_metadata_pool);
+  data_page->header.column_count = 0;
+  page_and_metadata->metadata = {};
+  page_and_metadata->metadata.bytes_written = sizeof(DataPageHeader);
+  page_and_metadata->page = data_page;
+  return page_and_metadata;
 }
 
 PerTableRequestInfo *schema_maps_get_new_request_info(ThreadLocalSchemaMaps *schema_maps) 
 {
-  auto request_info = (PerTableRequestInfo *)pool_alloc(&schema_maps->per_table_request_info_pool);
+  auto request_info = (PerTableRequestInfo *)pool_atomic_alloc(&schema_maps->per_table_request_info_pool);
   *request_info = {};
   request_info->strings_arena.memory = request_info->arena_backing;
   request_info->strings_arena.capacity = sizeof(request_info->arena_backing);
@@ -374,9 +411,9 @@ PerTableRequestInfo *schema_maps_get_new_request_info(ThreadLocalSchemaMaps *sch
   return request_info;
 }
 
-LocalTablePageMapValue *local_table_page_map_insert_new_page_and_info(ThreadLocalSchemaMaps *schema_maps, StringSlice8 table_name, TableID id) 
+RequestInfoAndPage *local_table_page_map_insert_new_page_and_info(ThreadLocalSchemaMaps *schema_maps, StringSlice8 table_name) 
 {
-  auto new_page = schema_maps_get_new_page(schema_maps);
+  auto page_and_metadata = schema_maps_get_new_page_and_metadata(schema_maps);
 	auto new_request_info = schema_maps_get_new_request_info(schema_maps);
 
 	auto &page_map = schema_maps->local_table_page_map;
@@ -395,20 +432,23 @@ LocalTablePageMapValue *local_table_page_map_insert_new_page_and_info(ThreadLoca
 		index = (index + 1) % page_map.capacity;
 		bucket = page_map.buckets[index];
 	}
-
+	auto id = TableID{ .index = ++schema_maps->table_id_count, .local_flag = 1 };
   bucket.hash = hash;
+	bucket.table_id = id;
 
 	auto &string = page_map.strings[index];
 	string.length = table_name.length;
 	std::memcpy(string.buffer, table_name.content, table_name.length);
-	bucket.value.info_and_page.request_info = new_request_info;
-  bucket.value.info_and_page.current_page = new_page;
-  bucket.value.info_and_page.page_head = new_page;
-	bucket.value.table_id = id;
-  return &bucket.value;
+  auto &request_info_and_page = page_map.info_and_page_arr[id.index];
+
+	request_info_and_page.request_info = new_request_info;
+  request_info_and_page.current_page = page_and_metadata;
+  request_info_and_page.page_head = page_and_metadata;
+
+  return &request_info_and_page;
 }
 
-LocalTablePageMapValue *local_table_page_map_lookup(ThreadLocalSchemaMaps *schema_maps, StringSlice8 table_name)
+RequestInfoAndPage *local_table_page_map_lookup(ThreadLocalSchemaMaps *schema_maps, StringSlice8 table_name)
 {
 	auto &page_map = schema_maps->local_table_page_map;
 	auto hash = std::hash<StringSlice8>{}(table_name);
@@ -420,7 +460,8 @@ LocalTablePageMapValue *local_table_page_map_lookup(ThreadLocalSchemaMaps *schem
 		if (bucket.hash == hash) {
 			auto string = page_map.strings[index];
 			if (StringSlice8{string.buffer, string.length} == table_name) {
-				return &bucket.value;
+        auto id = bucket.table_id;
+				return &page_map.info_and_page_arr[id.index];
 			}
 		}
 
@@ -446,10 +487,12 @@ RequestInfoAndPage *table_page_map_insert_new_page_and_info(ThreadLocalSchemaMap
 
   auto &slot = schema_maps->table_page_map_array[id.index];
 
-  auto new_page = schema_maps_get_new_page(schema_maps);
+  auto new_page = schema_maps_get_new_page_and_metadata(schema_maps);
 	slot.request_info = schema_maps_get_new_request_info(schema_maps);
   slot.current_page = new_page;
   slot.page_head = new_page;
+
+  schema_maps->active_global_table_pages[schema_maps->active_global_table_pages_count++] = id;
 
   return &slot;
 }
@@ -471,3 +514,48 @@ uint32_t get_data_size_from_col_type(ColumnDataType type)
 		return 0;
 	}
 }
+
+uint32_t get_offset_idx_from_id(ColumnID id)
+{
+	return id.local_flag ? id.index + DATA_PAGE_HEADER_SIZE : id.index;
+}
+
+String8 create_table_dict_file_path_from_name(Arena *a,
+					      DatabaseContext *context,
+					      StringSlice8 table_name)
+{
+	StringBuilder8 table_directory;
+	uint32_t table_file_path_length = context->db_name.length + 1 +
+					  table_name.length + 1 +
+					  sizeof("/tables/dict.meta") - 1;
+
+	string_builder8_init(a, &table_directory, table_file_path_length + 1);
+	string_builder8_append(&table_directory, context->db_name);
+	string_builder8_append(&table_directory,
+			       string8_from_cstring("/tables/"));
+	string_builder8_append(&table_directory, table_name);
+	string_builder8_append(&table_directory, string8_from_cstring("/dict.meta"));
+
+
+	return string_builder8_to_string(table_directory);
+}
+
+String8 create_table_hot_partition_path_from_name(Arena *a, 
+                                                  DatabaseContext *context, 
+                                                  StringSlice8 table_name) {
+
+	StringBuilder8 table_directory;
+	uint32_t table_file_path_length = context->db_name.length + 1 +
+					  table_name.length + 1 +
+					  sizeof("/tables/active_partition.data") - 1;
+
+	string_builder8_init(a, &table_directory, table_file_path_length + 1);
+	string_builder8_append(&table_directory, context->db_name);
+	string_builder8_append(&table_directory,
+			       string8_from_cstring("/tables/"));
+	string_builder8_append(&table_directory, table_name);
+	string_builder8_append(&table_directory, string8_from_cstring("/active_partition.data"));
+
+  return {table_directory.content, table_directory.length};
+}
+

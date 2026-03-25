@@ -12,13 +12,10 @@
 #define LOCAL_TABLE_PAGE_MAP_LIMIT (512)
 #define MAX_COLUMNS (1024)
 #define DATA_PAGE_SIZE (KILOBYTES(64))
-
 #include <stdint.h>
 
 #include "utils.h"
 #include "chrono_platform.h"
-
-struct DatabaseContext;
 
 #define MAX_TAGS (256)
 #define MAX_TABLE_NAME_SIZE (256u)
@@ -27,7 +24,6 @@ struct DatabaseContext;
 #define COLUMN_MAX_NAME_SIZE (63u)
 #define COLUMN_ID_MAP_SIZE (1024u)
 #define DATA_PAGE_HEADER_SIZE (512)
-
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <intrin.h>
@@ -88,6 +84,7 @@ inline int compare128(const void *a, const void *b)
 }
 
 #endif
+struct DatabaseContext;
 
 enum class TableSchemaChangeOp : uint32_t {
 	UPDATE_COL,
@@ -117,16 +114,30 @@ struct TableSchemaChange {
 	};
 };
 
+#define ColumnType(e, s)
+#define AllColumnDataTypes \
+ColumnType(INVALID, "Invalid Type") \
+ColumnType(TIMESTAMP, "Timestamp Type") \
+ColumnType(INT32, "Int 32") \
+ColumnType(FLOAT, "Single prescision float") \
+ColumnType(DOUBLE, "Double presision float") \
+ColumnType(INT64, "Int 64") \
+ColumnType(VARCHAR, "Varchar") \
+ColumnType(COUNT, "") \
+
+#undef ColumnType
+
+#define ColumnType(e, s) e,
 enum class ColumnDataType : uint32_t {
-	INVALID,
-	TIMESTAMP,
-	INT32,
-	FLOAT,
-	DOUBLE,
-	INT64,
-	VARCHAR,
-	COUNT,
+  AllColumnDataTypes
 };
+#undef ColumnType
+
+#define ColumnType(e, s) s,
+static const char *COLUMN_TYPE_STRINGS[] = {
+  AllColumnDataTypes
+};
+#undef ColumnType
 
 //TOOD(Ray): X macros 
 
@@ -326,15 +337,18 @@ struct PerTableRequestInfo {
   // Hash table info
   Arena strings_arena; // make sure memory is 16 byte aligned for simd
 	uint64_t table_schema_version;
-  SchemaString arena_backing[DATA_PAGE_HEADER_SIZE];
-	uint64_t new_column_hashes[DATA_PAGE_HEADER_SIZE];
-  VariableSchemaString *string_ptrs[DATA_PAGE_HEADER_SIZE];
-  uint32_t new_column_id_idxs[DATA_PAGE_HEADER_SIZE];
-	ColumnDataType new_column_types[DATA_PAGE_HEADER_SIZE];
-
-  // Global Column Info
+  uint64_t global_schema_version;
+  SchemaString table_name;
+  SchemaString arena_backing[MAX_COLUMNS];
+	uint64_t new_column_hashes[MAX_COLUMNS];
+  VariableSchemaString *string_ptrs[MAX_COLUMNS];
+  uint32_t new_column_id_idxs[MAX_COLUMNS];
+	ColumnDataType new_column_types[MAX_COLUMNS];
   uint32_t new_column_id_count; 
-  ColumnID global_column_ids[DATA_PAGE_HEADER_SIZE];
+  
+  //Global Column info
+  ColumnID global_column_ids[MAX_COLUMNS];
+  ColumnID global_column_hashes[MAX_COLUMNS]; 
 
   uint32_t column_offsets[MAX_COLUMNS];
   uint32_t running_offset;
@@ -347,42 +361,46 @@ struct DataPageHeader {
   uint32_t column_offsets[DATA_PAGE_HEADER_SIZE];
 };
 
-struct DataPage {
+struct DataPageMetadata {
   uint64_t start_timestamp;
   uint64_t end_timestamp;
-  DataPage *next_page;
   uint32_t bytes_written;
   bool is_out_of_order;
+};
+
+struct DataPage {
+  DataPageHeader header;
   char data[];
+};
+
+struct DataPageAndMetadata {
+  DataPageMetadata metadata;
+  DataPage *page;
+  DataPageAndMetadata *next;
 };
 
 struct RequestInfoAndPage {
   PerTableRequestInfo *request_info;
-  DataPage *page_head;
-  DataPage *current_page;
-};
-
-struct LocalTablePageMapValue {
-	TableID table_id;
-	RequestInfoAndPage info_and_page;
+  DataPageAndMetadata *page_head;
+  DataPageAndMetadata *current_page;
 };
 
 struct LocalTablePageMapBucket {
   uint64_t hash;
-	LocalTablePageMapValue value;
+	TableID table_id;
 };
 
 struct LocalTablePageMap {
-	SchemaString *strings;
-	LocalTablePageMapBucket *buckets;
-	uint32_t bucket_count;
-	uint32_t capacity;
+  SchemaString *strings;
+  LocalTablePageMapBucket *buckets;
+	RequestInfoAndPage *info_and_page_arr;
+  uint32_t capacity;
 };
 
 struct PrevRowColumnCacheEntry {
-  ColumnID id;
-  char *prev_string;
-  uint32_t prev_string_length;
+  TableID table_id;
+  ColumnID column_id;
+  StringSlice8 prev_string;
 };
 
 struct PrevRowColumnCache {
@@ -392,11 +410,14 @@ struct PrevRowColumnCache {
 
 struct ThreadLocalSchemaMaps {
 	Arena arena;
+  TableID *active_global_table_pages; // NOTE(Ray) This is only for actual tables 
 	PoolAllocator data_page_pool;
+  PoolAllocator data_page_and_metadata_pool;
   PoolAllocator per_table_request_info_pool;
 	RequestInfoAndPage *table_page_map_array;
 	LocalTablePageMap local_table_page_map;
 	uint32_t table_id_count;
+  uint32_t active_global_table_pages_count;
 };
 
 // NOTE(Ray): Column maps are pretty small the chances are that we get the empty slot first time is high
@@ -453,12 +474,15 @@ struct SchemaMapsResult {
 };
 
 
+static constexpr auto TABLE_PAGE_MAP_SIZE = MAX_TABLES * sizeof(RequestInfoAndPage);
+static constexpr auto TABLE_PAGES_SIZE = (DATA_PAGE_SIZE + sizeof(DataPage)) * TABLE_PAGE_LIMIT;
+static constexpr auto LOCAL_TABLE_PAGE_MAP_SIZE = DEFAULT_TABLE_CAPACITY * (sizeof(LocalTablePageMapBucket) + sizeof(SchemaString) + sizeof(RequestInfoAndPage));
+static constexpr auto TABLE_REQUEST_INFO_SIZE = TABLE_PAGE_LIMIT * sizeof(PerTableRequestInfo);
+static constexpr auto PAGE_AND_METADATA_SIZE = TABLE_PAGE_LIMIT * sizeof(DataPageAndMetadata);
+static constexpr auto ACTIVE_GLOBAL_TABLE_PAGES_SIZE = TABLE_PAGE_LIMIT * sizeof(TableID);
 
 inline int calculate_schema_padding_on_name_length(int64_t name_length);
 void put_column_info_on_disk_schema_column(ColumnInfo *info, MemoryMappedFile *schema_file);
-String8 create_table_dict_file_path_from_name(Arena *a,
-					      DatabaseContext *context,
-					      StringSlice8 table_name);
 TableNameSlot *_get_table_name_slot_ptr(SchemaMaps *schema_maps, uint32_t index);
 TableSchemaSlot *_get_table_schema_slot_ptr(SchemaMaps *schema_maps, uint32_t index);
 ColumnSlot *_get_column_slot_ptr(SchemaMaps *schema_maps, TableID table_id, uint32_t index);
@@ -468,6 +492,7 @@ void schema_maps_init(SchemaMaps *schema_maps, uint32_t table_capacity);
 ColumnID schema_maps_create_column(SchemaMaps *schema_maps, TableID id, StringSlice8 column_string,
 																	 ColumnDataType data_type);
 ColumnID schema_maps_lookup_column_id(SchemaMaps *schema_maps, TableID id, StringSlice8 column_string);
+ColumnID schema_maps_lookup_column_id(SchemaMaps *schema_maps, TableID id, StringSlice8 column_string, uint64_t hash);
 ColumnDataType schema_maps_get_column_data_type(SchemaMaps *schema_maps, TableID table_id, ColumnID column_id);
 SchemaTableMapBucket *_get_table_hash_map_first_bucket(SchemaMaps *schema_maps); 
 TableID schema_maps_lookup_table_id(SchemaMaps *schema_maps, StringSlice8 table_string); 
@@ -478,10 +503,16 @@ SchemaMaps *get_latest_schema_maps(SchemaCacheTrippleBuffer *maps);
 SchemaMapsResult get_latest_schema_maps_inc_refcount(SchemaCacheTrippleBuffer *maps);
 void schema_maps_dec_refcount(SchemaCacheTrippleBuffer *maps, SchemaMapsResult maps_result);
 void thread_local_schema_maps_init(ThreadLocalSchemaMaps *schema_maps);
-DataPage *schema_maps_get_new_page(ThreadLocalSchemaMaps *schema_maps); 
+DataPageAndMetadata *schema_maps_get_new_page_and_metadata(ThreadLocalSchemaMaps *schema_maps); 
 PerTableRequestInfo *schema_maps_get_new_request_info(ThreadLocalSchemaMaps *schema_maps); 
-LocalTablePageMapValue *local_table_page_map_insert_new_page_and_info(ThreadLocalSchemaMaps *schema_maps, StringSlice8 table_name, TableID id); 
-LocalTablePageMapValue *local_table_page_map_lookup(ThreadLocalSchemaMaps *schema_maps, StringSlice8 table_name);
+RequestInfoAndPage *local_table_page_map_insert_new_page_and_info(ThreadLocalSchemaMaps *schema_maps, StringSlice8 table_name); 
+RequestInfoAndPage *local_table_page_map_lookup(ThreadLocalSchemaMaps *schema_maps, StringSlice8 table_name);
 RequestInfoAndPage *table_page_map_lookup(ThreadLocalSchemaMaps *schema_maps, TableID id); 
 RequestInfoAndPage *table_page_map_insert_new_page_and_info(ThreadLocalSchemaMaps *schema_maps, TableID id);
 uint32_t get_data_size_from_col_type(ColumnDataType type); 
+SchemaMaps *_get_map_at_version(SchemaCacheTrippleBuffer *maps, uint64_t version);
+uint32_t get_offset_idx_from_id(ColumnID id);
+bool schema_maps_check_table_id_exists(SchemaMaps *schema_maps, TableID table_id);
+String8 create_table_dict_file_path_from_name(Arena *a, DatabaseContext *context, StringSlice8 table_name);
+String8 create_table_hot_partition_path_from_name(Arena *a, DatabaseContext *context, StringSlice8 table_name);
+

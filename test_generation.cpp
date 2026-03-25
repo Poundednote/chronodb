@@ -3,6 +3,7 @@
 #include "chrono_platform.cpp"
 
 #include "utils.h"
+#include "context.h"
 #include "metadata.cpp"
 
 
@@ -12,7 +13,7 @@ int main(void)
 	arena_init(&main_arena, GIGABYTES(1));
 
 	create_directory("./TEST_DB/");
-	FileHandle fh = create_file("./TEST_DB/datadict.data");
+	auto fh = create_file("./TEST_DB/datadict.meta", false);
 	MemoryMappedFile data_dict_file = {};
 	memory_map_file_handle_append(&data_dict_file, fh, KILOBYTES(256));
 
@@ -37,13 +38,13 @@ int main(void)
 
 		StringBuilder8 table_dir;
 		string_builder8_init(&main_arena, &table_dir,
-				     sizeof("TEST_DB/tables/") + table_name.length + sizeof("/dict.data"));
+				     sizeof("TEST_DB/tables/") + table_name.length + sizeof("/dict.meta"));
 		string_builder8_append(&table_dir, string8_from_cstring("TEST_DB/tables/"));
 		create_directory((const char *)table_dir.content);
 		string_builder8_append(&table_dir, table_name);
 		create_directory((const char *)table_dir.content);
-		string_builder8_append(&table_dir, string8_from_cstring("/dict.data"));
-		FileHandle schema_fh = create_file((const char *)table_dir.content);
+		string_builder8_append(&table_dir, string8_from_cstring("/dict.meta"));
+		auto schema_fh = create_file((const char *)table_dir.content, false);
 
 		MemoryMappedFile schema_file;
 		memory_map_file_handle_append(&schema_file, schema_fh, KILOBYTES(1));

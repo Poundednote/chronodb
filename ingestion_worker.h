@@ -2,7 +2,16 @@
 
 #include "utils.h"
 #include "metadata.h"
-#include "context.h"
+
+struct DatabaseContext;
+
+struct IngestionWorkerContext {
+	uint16_t thread_id;
+	Arena transient_arena;
+	ThreadLocalSchemaMaps schema_maps;
+  double ms_time_taken;
+  uint64_t prev_timestamp;
+};
 
 struct Tokeniser {
   char *at;
@@ -48,11 +57,11 @@ void request_info_assign_offset(PerTableRequestInfo *request_info, ColumnID id, 
 ColumnID request_info_insert_or_match(PerTableRequestInfo *request_info, ParseColumnResult *result);
 ColumnID request_info_insert(PerTableRequestInfo *request_info, ParseColumnResult *result);
 
-void insert_col_info_to_row_cache_at_index(PrevRowColumnCache *cache, ColumnID id, ParseColumnResult parsed_column,
+void insert_col_info_to_row_cache_at_index(PrevRowColumnCache *cache, TableID table_id, ColumnID column_id, ParseColumnResult parsed_column,
 																					 int index);
 
 void write_parsed_data(ThreadLocalSchemaMaps *schema_maps, uint64_t timestamp,
 											 RequestInfoAndPage *request_info_and_page, PrevRowColumnCache cache,
 											 ParseColumnResultList parsed_columns);
-void *process_write_request(ThreadContext *t_ctx, DatabaseContext *context, String8 data_to_write);
+void *process_write_request(IngestionWorkerContext *t_ctx, DatabaseContext *context, String8 data_to_write);
 uint32_t get_data_size_from_col_type(ColumnDataType type);

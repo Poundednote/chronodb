@@ -4,9 +4,11 @@
 #include <algorithm>
 
 #include "utils.h"
+#include "chrono.h"
+#include "workqueue.h"
 #include "metadata.h"
 #include "ingestion_worker.h"
-
+#include "writer.h"
 
 #if defined (__APPLE__)
 #include <stdlib.h>
@@ -23,9 +25,55 @@ inline bool parse_double(char* str, char* end_ptr, double* out_value) {
 }
 
 #else
+void ingestion_worker_start_routine(DatabaseContext *db_context, IngestionWorkerContext *t_ctx, uint16_t thread_id,
+																		MPMCWorkQueue *wq)
+{
+	t_ctx->thread_id = thread_id;
+
+  t_ctx->prev_timestamp = platform_get_high_res_timer_stamp();
+	while (!wq->stop_flag.load(std::memory_order::acquire)) {
+		mpmc_work_queue_dequeue_entry(t_ctx, wq);
+
+    if (compute_time_in_ms(t_ctx->prev_timestamp, platform_get_high_res_timer_stamp()) > 10) {
+      auto active_global_table_id_arr = t_ctx->schema_maps.active_global_table_pages;
+      auto global_pages = t_ctx->schema_maps.table_page_map_array;
+      for (auto i = 0; i < t_ctx->schema_maps.active_global_table_pages_count; ++i) {
+        auto id = active_global_table_id_arr[i];
+        MPSCWriterQueueEntry entry = {};
+        entry.table_id = id;
+        entry.request_info_and_page = global_pages[id.index];
+        entry.thread_id = t_ctx->thread_id;
+
+
+        writer_queues_enqueue_entry(&db_context->writer_queues, entry);
+      }
+
+      std::memset(t_ctx->schema_maps.table_page_map_array, 0, TABLE_PAGE_MAP_SIZE);
+      t_ctx->schema_maps.active_global_table_pages_count = 0;
+
+      auto local_pages = t_ctx->schema_maps.local_table_page_map;
+      for (uint32_t i = 0; i < t_ctx->schema_maps.table_id_count; ++i) {
+        MPSCWriterQueueEntry entry = {};
+        auto actual_idx = i + 1;
+        entry.table_id = {.index = actual_idx, .local_flag = 1};
+        entry.request_info_and_page = local_pages.info_and_page_arr[actual_idx];
+        entry.thread_id = t_ctx->thread_id;
+
+        writer_queues_enqueue_entry(&db_context->writer_queues, entry);
+      }
+
+      t_ctx->prev_timestamp = platform_get_high_res_timer_stamp();
+
+      std::memset(local_pages.buckets, 0, sizeof(LocalTablePageMapBucket) * local_pages.capacity);
+      std::memset(local_pages.info_and_page_arr, 0, sizeof(RequestInfoAndPage) * t_ctx->schema_maps.table_id_count);
+      t_ctx->schema_maps.table_id_count = 0;
+    }
+	}
+}
+
 inline bool parse_double(const char *str, char *end_ptr, double *out_value)
 {
-	auto parsing_res = std::from_chars((char *)str, (char *)end_ptr, out_value);
+	auto parsing_res = std::from_chars((char *)str, (char *)end_ptr, *out_value);
 	return parsing_res.ec == std::errc::invalid_argument;
 }
 #endif
@@ -219,11 +267,6 @@ void parse_columns(Arena *a, ParseColumnResultList *results_array, StringSlice8 
 	}
 }
 
-uint32_t get_offset_idx_from_id(ColumnID id)
-{
-	return id.local_flag ? id.index + DATA_PAGE_HEADER_SIZE : id.index;
-}
-
 void request_info_assign_offset(PerTableRequestInfo *request_info, ColumnID id, ColumnDataType type)
 {
   auto &offset_slot = request_info->column_offsets[get_offset_idx_from_id(id)];
@@ -231,6 +274,13 @@ void request_info_assign_offset(PerTableRequestInfo *request_info, ColumnID id, 
 		offset_slot = request_info->running_offset;
 		request_info->running_offset += std::max(8u, get_data_size_from_col_type(type));
 	}
+}
+
+void output_column_error_message(const char *prepend_string, StringSlice8 table_name, ColumnDataType actual_type, ColumnDataType expected_type) {
+  auto expected_type_str = COLUMN_TYPE_STRINGS[static_cast<int32_t>(expected_type)];
+  auto actual_type_str = COLUMN_TYPE_STRINGS[static_cast<int32_t>(actual_type)];
+	fprintf(stderr, "%s\nMismatch column type in table: %.*s, expected type: %s, parsed type: %s\n", prepend_string, table_name.length,
+					table_name.content, expected_type_str, actual_type_str);
 }
 
 ColumnID request_info_insert_or_match(PerTableRequestInfo *request_info, ParseColumnResult *result) {
@@ -244,7 +294,6 @@ ColumnID request_info_insert_or_match(PerTableRequestInfo *request_info, ParseCo
 			if (StringSlice8{ name->buffer, name->length } == result->name) {
 				auto &id_index = request_info->new_column_id_idxs[index];
 				if (request_info->new_column_types[id_index] != result->type) {
-					fprintf(stderr, "Mismatch Column Type\n");
 					return {};
 				} else {
           return {.index = id_index, .local_flag = 1};
@@ -328,13 +377,14 @@ StringSlice8 tokeniser_get_slice_to(Tokeniser *t, String8 data, char target)
   return result;
 }
 
-void insert_col_info_to_row_cache_at_index(PrevRowColumnCache *cache, ColumnID id, ParseColumnResult parsed_column,
+
+void insert_col_info_to_row_cache_at_index(PrevRowColumnCache *cache, TableID table_id, ColumnID column_id, ParseColumnResult parsed_column,
 																					 int index)
 {
   auto &cache_entry = cache->entries[index];
-	cache_entry.id = id;
-	cache_entry.prev_string = (char *)parsed_column.name.content;
-	cache_entry.prev_string_length = parsed_column.name.length;
+  cache_entry.table_id = table_id;
+	cache_entry.column_id = column_id;
+	cache_entry.prev_string = parsed_column.name;
 }
 
 void write_parsed_data(ThreadLocalSchemaMaps *schema_maps, uint64_t timestamp, RequestInfoAndPage *request_info_and_page, PrevRowColumnCache cache,
@@ -342,16 +392,7 @@ void write_parsed_data(ThreadLocalSchemaMaps *schema_maps, uint64_t timestamp, R
 {
   // calculate row size
   auto request_info = request_info_and_page->request_info;
-  auto data_page = request_info_and_page->current_page;
-  if (!data_page->start_timestamp) {
-    data_page->start_timestamp = timestamp;
-  }
-
-  if (data_page->end_timestamp > timestamp) {
-    data_page->is_out_of_order = true;
-  } else {
-    data_page->end_timestamp = timestamp;  // always set the end timstamp to the latest even for out of order data
-  }
+  auto page_and_metadata = request_info_and_page->current_page;
 
   uint64_t maximum_offset = 0; // theoretically can have a uint16_t but need the 64 for alignment
   uint64_t max_offset_data_size = 0;
@@ -359,7 +400,7 @@ void write_parsed_data(ThreadLocalSchemaMaps *schema_maps, uint64_t timestamp, R
     auto &parsed_column = parsed_columns.results[i];
     auto &cache_entry = cache.entries[i];
     auto data_size = std::max(8u, get_data_size_from_col_type(parsed_column.type));
-    auto offset = request_info->column_offsets[get_offset_idx_from_id(cache_entry.id)] + sizeof(uint64_t);
+    auto offset = request_info->column_offsets[get_offset_idx_from_id(cache_entry.column_id)] + sizeof(uint64_t);
 
 		if (maximum_offset < offset) {
 			maximum_offset = offset;
@@ -369,22 +410,35 @@ void write_parsed_data(ThreadLocalSchemaMaps *schema_maps, uint64_t timestamp, R
 
 
 
-  auto current_page_ptr = &request_info_and_page->current_page;
-	if ((*current_page_ptr)->bytes_written + maximum_offset + max_offset_data_size >= DATA_PAGE_SIZE) {
-		(*current_page_ptr)->next_page = (DataPage *)schema_maps_get_new_page(schema_maps);
-		*current_page_ptr = (*current_page_ptr)->next_page;
+  auto current_page_and_metadata_ptr = &request_info_and_page->current_page;
+	if ((*current_page_and_metadata_ptr)->metadata.bytes_written + maximum_offset + max_offset_data_size >= DATA_PAGE_SIZE) {
+		(*current_page_and_metadata_ptr)->next = schema_maps_get_new_page_and_metadata(schema_maps);
+		*current_page_and_metadata_ptr = (*current_page_and_metadata_ptr)->next;
 	}
 
-  auto current_page = request_info_and_page->current_page;
-  
-  auto write_ptr = current_page->data + current_page->bytes_written;
-  *(uint64_t *)write_ptr = maximum_offset + max_offset_data_size;
+  auto &metadata = request_info_and_page->current_page->metadata;
+
+  if (!metadata.start_timestamp) {
+    metadata.start_timestamp = timestamp;
+  }
+
+  if (metadata.end_timestamp > timestamp) {
+    metadata.is_out_of_order = true;
+  } else {
+    metadata.end_timestamp = timestamp;  // always set the end timstamp to the latest even for out of order data
+  }
+
+	auto current_page = request_info_and_page->current_page->page;
+
+  auto write_ptr = (uint8_t *)(current_page) + metadata.bytes_written;
+  assert((uint64_t)write_ptr % 8 == 0);
+  *((uint64_t *)(write_ptr)) = maximum_offset + max_offset_data_size;
 	for (int i = 0; i < parsed_columns.n_results; ++i) {
     auto &parsed_column = parsed_columns.results[i];
     auto &cache_entry = cache.entries[i];
 
 		auto data_size = std::max(8u, get_data_size_from_col_type(parsed_column.type));
-		auto offset = request_info->column_offsets[get_offset_idx_from_id(cache_entry.id)] + sizeof(uint64_t); // add the size of the row length
+		auto offset = request_info->column_offsets[get_offset_idx_from_id(cache_entry.column_id)] + sizeof(uint64_t); // add the size of the row length
 		auto col_ptr = write_ptr + offset;
 
     switch (parsed_column.type)
@@ -412,12 +466,13 @@ void write_parsed_data(ThreadLocalSchemaMaps *schema_maps, uint64_t timestamp, R
 		}
 	}
 
-  current_page->bytes_written += maximum_offset + max_offset_data_size;
-  assert(current_page->bytes_written <= DATA_PAGE_SIZE);
+  metadata.bytes_written += maximum_offset + max_offset_data_size;
+  assert(metadata.bytes_written <= DATA_PAGE_SIZE);
 }
 
-void *process_write_request(ThreadContext *t_ctx, DatabaseContext *context, String8 data_to_write)
+void *process_write_request(IngestionWorkerContext *t_ctx, DatabaseContext *context, String8 data_to_write)
 {
+
 	auto time_start = platform_get_high_res_timer_stamp();
 	auto schema_maps_result = get_latest_schema_maps_inc_refcount(&context->schema_maps_tripple_buffer);
 	auto global_schema_maps = schema_maps_result.maps;
@@ -441,6 +496,18 @@ void *process_write_request(ThreadContext *t_ctx, DatabaseContext *context, Stri
 			continue;
 		}
 
+    bool is_full_line_to_parse = false;
+    for (int i = tokeniser.at - (char *)data_to_write.content; i < data_to_write.length; ++i) {
+      if (data_to_write.content[i] == '\n') {
+        is_full_line_to_parse = true;
+        break;
+      }
+    }
+
+    if (!is_full_line_to_parse) {
+      goto cleanup;
+    }
+
 		//TODO(Ray) write an actual parser using SIMD - this is painful
 		StringSlice8 table_name = tokeniser_get_slice_to(&tokeniser, data_to_write, ' ');
     tokeniser.at++; // skip the whitespace
@@ -452,7 +519,7 @@ void *process_write_request(ThreadContext *t_ctx, DatabaseContext *context, Stri
 
     if (result.ec == std::errc::invalid_argument) {
       fprintf(stderr, "Failure to parse timestamp\n");
-      return 0;
+      goto cleanup;
     }
 
 		StringSlice8 tags = tokeniser_get_slice_to(&tokeniser, data_to_write, ']');
@@ -466,41 +533,42 @@ void *process_write_request(ThreadContext *t_ctx, DatabaseContext *context, Stri
 		if (!table_id.id) {
 			auto page_map_result = local_table_page_map_lookup(local_schema_maps, table_name);
 
-      // might get a valid entry but no page
 			if (!page_map_result) {
-				table_id = { .index = ++local_schema_maps->table_id_count, .local_flag = 1 };
-				page_map_result = local_table_page_map_insert_new_page_and_info(local_schema_maps, table_name, table_id);
-        auto request_info = page_map_result->info_and_page.request_info;
+				page_map_result = local_table_page_map_insert_new_page_and_info(local_schema_maps, table_name);
+        auto request_info = page_map_result->request_info;
+
+        request_info->table_name.length = table_name.length;
+        std::memcpy(request_info->table_name.buffer, table_name.content, table_name.length);
 
 				for (int i = 0; i < parsed_columns_array.n_results; ++i) {
 					auto &parsed_column = parsed_columns_array.results[i];
-					auto id = request_info_insert(request_info, &parsed_column);
-					request_info->new_column_types[id.index] = parsed_column.type;
-					insert_col_info_to_row_cache_at_index(&prev_row_col_cache, id, parsed_column, i);
+					auto column_id = request_info_insert(request_info, &parsed_column);
+					request_info->new_column_types[column_id.index] = parsed_column.type;
+					insert_col_info_to_row_cache_at_index(&prev_row_col_cache, table_id, column_id, parsed_column, i);
 				}
 
-				write_parsed_data(local_schema_maps, timestamp, &page_map_result->info_and_page, prev_row_col_cache, parsed_columns_array);
+				write_parsed_data(local_schema_maps, timestamp, page_map_result, prev_row_col_cache, parsed_columns_array);
 
 			} else {
-        auto request_info = page_map_result->info_and_page.request_info;
-        if (!page_map_result->info_and_page.page_head) {
+        if (!page_map_result->page_head) {
           // if no page, clear the info and get a new page for now
-          page_map_result->info_and_page.page_head = schema_maps_get_new_page(local_schema_maps);
-          page_map_result->info_and_page.request_info = schema_maps_get_new_request_info(local_schema_maps);
+          page_map_result->page_head = schema_maps_get_new_page_and_metadata(local_schema_maps);
+          page_map_result->request_info = schema_maps_get_new_request_info(local_schema_maps);
         }
 
 				for (int i = 0; i < parsed_columns_array.n_results; ++i) {
 					auto &parsed_column = parsed_columns_array.results[i];
 					auto &cache_entry = prev_row_col_cache.entries[i];
-					if (StringSlice8{ cache_entry.prev_string, cache_entry.prev_string_length } != parsed_column.name) {
-						auto id = request_info_insert_or_match(request_info, &parsed_columns_array.results[i]);
-						insert_col_info_to_row_cache_at_index(&prev_row_col_cache, id, parsed_column, i);
-					} else if (request_info->new_column_types[cache_entry.id.index] != parsed_column.type) {
-						fprintf(stderr, "Mismatch Column Type");
-						return 0;
+          auto &cached_type = page_map_result->request_info->new_column_types[cache_entry.column_id.index];
+					if (cache_entry.table_id == table_id && cache_entry.prev_string != parsed_column.name) {
+						auto column_id = request_info_insert_or_match(page_map_result->request_info, &parsed_columns_array.results[i]);
+						insert_col_info_to_row_cache_at_index(&prev_row_col_cache, table_id, column_id, parsed_column, i);
+					} else if (cached_type != parsed_column.type) {
+						output_column_error_message("Error in the local cache", table_name, parsed_column.type, cached_type);
+            goto cleanup;
 					}
 
-					write_parsed_data(local_schema_maps, timestamp, &page_map_result->info_and_page, prev_row_col_cache, parsed_columns_array);
+					write_parsed_data(local_schema_maps, timestamp, page_map_result, prev_row_col_cache, parsed_columns_array);
 				}
 			}
 		} else {
@@ -508,7 +576,6 @@ void *process_write_request(ThreadContext *t_ctx, DatabaseContext *context, Stri
 			auto page_and_info = table_page_map_lookup(local_schema_maps, table_id);
       auto request_info = page_and_info->request_info;
 			if (!page_and_info->page_head) {
-
 				page_and_info = table_page_map_insert_new_page_and_info(local_schema_maps, table_id);
         request_info = page_and_info->request_info;
 				request_info->table_schema_version = schema_maps_lookup_table_schema_by_id(global_schema_maps, table_id)->version;
@@ -516,18 +583,19 @@ void *process_write_request(ThreadContext *t_ctx, DatabaseContext *context, Stri
 				for (int i = 0; i < parsed_columns_array.n_results; ++i) {
 					auto &parsed_column = parsed_columns_array.results[i];
 					auto column_id = schema_maps_lookup_column_id(global_schema_maps, table_id, parsed_column.name);
+          auto expected_type = schema_maps_get_column_data_type(global_schema_maps, table_id, column_id);
 					if (!column_id.id) {
 						column_id = request_info_insert(request_info, &parsed_column);
 					} else {
-						if (schema_maps_get_column_data_type(global_schema_maps, table_id, column_id) != parsed_column.type) {
-							fprintf(stderr, "Mismatch Column Type");
-							return 0;
+						if ( expected_type != parsed_column.type) {
+							output_column_error_message("Error in global table info", table_name, parsed_column.type, expected_type);
+              goto cleanup;
 						};
             request_info->global_column_ids[column_id.index] = column_id;
 					}
 
           request_info_assign_offset(request_info, column_id, parsed_column.type);
-          insert_col_info_to_row_cache_at_index(&prev_row_col_cache, column_id, parsed_column, i);
+          insert_col_info_to_row_cache_at_index(&prev_row_col_cache, table_id, column_id, parsed_column, i);
 				}
 
 				write_parsed_data(local_schema_maps, timestamp, page_and_info, prev_row_col_cache, parsed_columns_array);
@@ -539,34 +607,42 @@ void *process_write_request(ThreadContext *t_ctx, DatabaseContext *context, Stri
 					auto &parsed_column = parsed_columns_array.results[i];
 					auto &cache_entry = prev_row_col_cache.entries[i];
           auto new_col = false;
-					if (StringSlice8{ cache_entry.prev_string, cache_entry.prev_string_length } != parsed_column.name) {
+					if (cache_entry.table_id == table_id && cache_entry.prev_string != parsed_column.name) {
             auto column_id = schema_maps_lookup_column_id(global_schema_maps, table_id, parsed_column.name);
+            auto expected_type = schema_maps_get_column_data_type(global_schema_maps, table_id, column_id);
             if (!column_id.id) 
             {
 							column_id = request_info_insert_or_match(request_info, &parsed_columns_array.results[i]);
+
               if (!column_id.id) {
-                return 0;
+                goto cleanup;
               }
+
 						} else {
-              if (schema_maps_get_column_data_type(global_schema_maps, table_id, column_id) != parsed_column.type) {
-                fprintf(stderr, "Mismatch Column Type");
-                return 0;
+              if (expected_type != parsed_column.type) {
+                output_column_error_message("Erorr in request info", table_name, parsed_column.type, expected_type);
+                goto cleanup;
               }
             }
 
-            insert_col_info_to_row_cache_at_index(&prev_row_col_cache, column_id, parsed_column, i);
+            insert_col_info_to_row_cache_at_index(&prev_row_col_cache, table_id, column_id, parsed_column, i);
 
 					} else {
             ColumnDataType data_type{};
-            if (cache_entry.id.local_flag) {
-              data_type = request_info->new_column_types[cache_entry.id.index];
+            bool is_cached = false;
+            if (cache_entry.column_id.local_flag) {
+              data_type = request_info->new_column_types[cache_entry.column_id.index];
+              if (data_type != parsed_column.type) {
+                output_column_error_message("Error in cache table", table_name, parsed_column.type, data_type);
+                goto cleanup;
+              }
             } else {
-              data_type = schema_maps_get_column_data_type(global_schema_maps, table_id, cache_entry.id);
-            }
+              data_type = schema_maps_get_column_data_type(global_schema_maps, table_id, cache_entry.column_id);
+              if (data_type != parsed_column.type) {
+                output_column_error_message("Error in global table", table_name, parsed_column.type, data_type);
+                goto cleanup;
+              }
 
-            if (data_type != parsed_column.type) {
-              fprintf(stderr, "Mismatch Column Type");
-              return 0;
             }
           }
 				}
@@ -578,6 +654,8 @@ void *process_write_request(ThreadContext *t_ctx, DatabaseContext *context, Stri
 
 		parsed_columns_array.n_results = 0;
 	}
+
+cleanup:
 
 	schema_maps_dec_refcount(&context->schema_maps_tripple_buffer, schema_maps_result);
 	arena_clear(&t_ctx->transient_arena);
