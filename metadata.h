@@ -161,8 +161,8 @@ struct SchemaColumnInfo {
 // to add it to the cache i would need some growable array
 PACKED_STRUCT_START
 struct DataDictSchema {
-	uint64_t number_of_rows_in_table;
-	uint32_t name_length;
+	int64_t number_of_rows_in_table;
+	int32_t name_length;
 	char table_name[];
 };
 PACKED_STRUCT_END
@@ -283,7 +283,7 @@ struct TableSchema {
 };
 
 struct SchemaString {
-	uint8_t length;
+	int8_t length;
 	char buffer[63];
 };
 
@@ -348,41 +348,36 @@ struct PerTableRequestInfo {
   
   //Global Column info
   ColumnID global_column_ids[MAX_COLUMNS];
-  ColumnID global_column_hashes[MAX_COLUMNS]; 
 
   uint32_t column_offsets[MAX_COLUMNS];
   uint32_t running_offset;
+  int64_t row_count;
 };
 
-// TODO(Ray) Take these out from the header and have the writer thread build the header
+struct DataPage {
+  char data[DATA_PAGE_SIZE];
+};
+
 struct DataPageHeader {
-	uint64_t column_count;
+
+  bool is_out_of_order; 
+  uint64_t start_timestamp;
+  uint64_t end_timestamp;
+  uint32_t row_write_offset;
+  uint32_t bytes_written;
+  uint32_t string_data_end; // string data is stored bottom up
+  uint64_t next_page;
+
+	int64_t column_count;
 	ColumnIDAndType column_data[DATA_PAGE_HEADER_SIZE];
   uint32_t column_offsets[DATA_PAGE_HEADER_SIZE];
 };
 
-struct DataPageMetadata {
-  uint64_t start_timestamp;
-  uint64_t end_timestamp;
-  uint32_t bytes_written;
-  bool is_out_of_order;
-};
-
-struct DataPage {
-  DataPageHeader header;
-  char data[];
-};
-
-struct DataPageAndMetadata {
-  DataPageMetadata metadata;
-  DataPage *page;
-  DataPageAndMetadata *next;
-};
 
 struct RequestInfoAndPage {
   PerTableRequestInfo *request_info;
-  DataPageAndMetadata *page_head;
-  DataPageAndMetadata *current_page;
+  DataPage *page_head;
+  DataPage *current_page;
 };
 
 struct LocalTablePageMapBucket {
@@ -411,9 +406,8 @@ struct PrevRowColumnCache {
 struct ThreadLocalSchemaMaps {
 	Arena arena;
   TableID *active_global_table_pages; // NOTE(Ray) This is only for actual tables 
-	PoolAllocator data_page_pool;
-  PoolAllocator data_page_and_metadata_pool;
-  PoolAllocator per_table_request_info_pool;
+	PoolAllocatorSPSCFreeList<DataPage> data_page_pool;
+  PoolAllocatorSPSCFreeList<PerTableRequestInfo> per_table_request_info_pool;
 	RequestInfoAndPage *table_page_map_array;
 	LocalTablePageMap local_table_page_map;
 	uint32_t table_id_count;
@@ -432,7 +426,7 @@ struct ColumnHashTableBucket {
 
 struct ColumnHashTable {
 	ColumnHashTableBucket *buckets;
-	uint64_t capacity;
+	int64_t capacity;
 };
 
 struct ColumnSchema {
@@ -478,7 +472,6 @@ static constexpr auto TABLE_PAGE_MAP_SIZE = MAX_TABLES * sizeof(RequestInfoAndPa
 static constexpr auto TABLE_PAGES_SIZE = (DATA_PAGE_SIZE + sizeof(DataPage)) * TABLE_PAGE_LIMIT;
 static constexpr auto LOCAL_TABLE_PAGE_MAP_SIZE = DEFAULT_TABLE_CAPACITY * (sizeof(LocalTablePageMapBucket) + sizeof(SchemaString) + sizeof(RequestInfoAndPage));
 static constexpr auto TABLE_REQUEST_INFO_SIZE = TABLE_PAGE_LIMIT * sizeof(PerTableRequestInfo);
-static constexpr auto PAGE_AND_METADATA_SIZE = TABLE_PAGE_LIMIT * sizeof(DataPageAndMetadata);
 static constexpr auto ACTIVE_GLOBAL_TABLE_PAGES_SIZE = TABLE_PAGE_LIMIT * sizeof(TableID);
 
 inline int calculate_schema_padding_on_name_length(int64_t name_length);
@@ -503,7 +496,7 @@ SchemaMaps *get_latest_schema_maps(SchemaCacheTrippleBuffer *maps);
 SchemaMapsResult get_latest_schema_maps_inc_refcount(SchemaCacheTrippleBuffer *maps);
 void schema_maps_dec_refcount(SchemaCacheTrippleBuffer *maps, SchemaMapsResult maps_result);
 void thread_local_schema_maps_init(ThreadLocalSchemaMaps *schema_maps);
-DataPageAndMetadata *schema_maps_get_new_page_and_metadata(ThreadLocalSchemaMaps *schema_maps); 
+DataPage *schema_maps_get_new_page_and_metadata(ThreadLocalSchemaMaps *schema_maps); 
 PerTableRequestInfo *schema_maps_get_new_request_info(ThreadLocalSchemaMaps *schema_maps); 
 RequestInfoAndPage *local_table_page_map_insert_new_page_and_info(ThreadLocalSchemaMaps *schema_maps, StringSlice8 table_name); 
 RequestInfoAndPage *local_table_page_map_lookup(ThreadLocalSchemaMaps *schema_maps, StringSlice8 table_name);

@@ -9,7 +9,8 @@ struct IngestionWorkerContext {
 	uint16_t thread_id;
 	Arena transient_arena;
 	ThreadLocalSchemaMaps schema_maps;
-  double ms_time_taken;
+  volatile uint64_t timer_diffs;
+  volatile int64_t run_count;
   uint64_t prev_timestamp;
 };
 

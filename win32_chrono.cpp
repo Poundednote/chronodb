@@ -13,6 +13,7 @@
 
 
 #define mmf_append_struct(mmf, struct_data) mmf_append(mmf, (void *)(struct_data), sizeof(*struct_data))
+#define yield_processor() YieldProcessor()
 
 #if defined(_M_ARM64)
     #define IS_ARM64 1
@@ -89,7 +90,7 @@
 #define PACKED_STRUCT_START __pragma(pack(push, 1))
 #define PACKED_STRUCT_END __pragma(pack(pop))
 
-size_t get_filesize(const char *path) {
+int64_t get_filesize(const char *path) {
 
 	HANDLE fh = CreateFile(path, GENERIC_READ, FILE_SHARE_READ, NULL,
 		   OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -113,7 +114,7 @@ OSHandle create_file(const char *path, bool is_async)
 	HANDLE fh = CreateFile(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL,
 		   OPEN_ALWAYS, flags, NULL);
 
-	return fh == INVALID_HANDLE_VALUE ? OSHandle{} : OSHandle{true, fh};
+	return fh == INVALID_HANDLE_VALUE ? OSHandle{false, (void *)GetLastError()} : OSHandle{true, fh};
 }
 
 OSHandle create_file_direct_asio(const char *path)
@@ -122,7 +123,7 @@ OSHandle create_file_direct_asio(const char *path)
 	HANDLE fh = CreateFile(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL,
 		   OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING, NULL);
 
-	return fh == INVALID_HANDLE_VALUE ? OSHandle{} : OSHandle{true, fh};
+	return fh == INVALID_HANDLE_VALUE ? OSHandle{false, (void *)GetLastError()} : OSHandle{true, fh};
 }
 
 
@@ -144,7 +145,7 @@ int read_entire_file(const char *path, void *buffer, size_t buffer_size) {
 	return success ? result : 0;
 }
 
-void memory_map_file_handle_read_only(MemoryMappedFile *mmf, OSHandle handle, uint64_t filesize) 
+void memory_map_file_handle_read_only(MemoryMappedFile *mmf, OSHandle handle, int64_t filesize) 
 {
 	HANDLE fh = handle.os_handle;
 
@@ -167,12 +168,12 @@ void memory_map_file_handle_read_only(MemoryMappedFile *mmf, OSHandle handle, ui
 	CloseHandle(mapping_handle);
 	CloseHandle(fh);
 
-	uint64_t mapping_size = *(uint64_t *)(&filesize);
-	*mmf = MemoryMappedFile{handle, file_memory, mapping_size, mapping_size, MMFileAccess::READ};
+	*mmf = MemoryMappedFile{handle, file_memory, filesize, filesize, MMFileAccess::READ};
 }
 
 void memory_map_entire_file_read_only(MemoryMappedFile *mmf, const char *filepath) 
 {
+  auto filesize = get_filesize(filepath);
 	HANDLE fh = CreateFileA(
 		filepath,
 		GENERIC_READ, 
@@ -186,11 +187,11 @@ void memory_map_entire_file_read_only(MemoryMappedFile *mmf, const char *filepat
 		return; 
 	}
 
-	memory_map_file_handle_read_only(mmf, OSHandle{true, fh}, 0);
+	memory_map_file_handle_read_only(mmf, OSHandle{true, fh}, filesize);
 }
 
 
-void memory_map_file_handle_append(MemoryMappedFile *mmf, OSHandle handle, uint64_t append_size) 
+void memory_map_file_handle_append(MemoryMappedFile *mmf, OSHandle handle, int64_t append_size) 
 {
 	HANDLE fh = handle.os_handle;
 	*mmf = {};
@@ -204,10 +205,10 @@ void memory_map_file_handle_append(MemoryMappedFile *mmf, OSHandle handle, uint6
 	LARGE_INTEGER file_size = {};
 	GetFileSizeEx(fh, &file_size);
 
-	uint64_t mapping_size = file_size.QuadPart + append_size;
+	auto mapping_size = file_size.QuadPart + append_size;
 	HANDLE mapping_handle =
 		CreateFileMappingA(fh, NULL, PAGE_READWRITE,
-				   mapping_size >> 32, mapping_size & 0xFFFFFFFF, NULL);
+				   mapping_size >> 32, mapping_size & 0x00000000FFFFFFFF, NULL);
 
 
 	if (mapping_handle == NULL) {
@@ -223,10 +224,10 @@ void memory_map_file_handle_append(MemoryMappedFile *mmf, OSHandle handle, uint6
 
 	CloseHandle(mapping_handle);
 
-	*mmf = MemoryMappedFile{handle, file_memory, mapping_size, *(uint64_t *)(&file_size.QuadPart), MMFileAccess::WRITE};
+	*mmf = MemoryMappedFile{handle, file_memory, mapping_size, *(int64_t *)(&file_size.QuadPart), MMFileAccess::WRITE};
 }
 
-void memory_map_entire_file_append(MemoryMappedFile *mmf, const char *filepath, uint64_t append_size) 
+void memory_map_entire_file_append(MemoryMappedFile *mmf, const char *filepath, int64_t append_size) 
 {
 	*mmf = {};
 	HANDLE fh = CreateFileA(filepath, GENERIC_READ | GENERIC_WRITE, 0, NULL,
@@ -252,8 +253,9 @@ void unmap_file(MemoryMappedFile *mmf)
 	mmf = {};
 }
 
-void *mmf_mapping_offset_ptr(MemoryMappedFile *mmf, uint64_t offset) 
+void *mmf_mapping_offset_ptr(MemoryMappedFile *mmf, int64_t offset) 
 {
+  assert(offset > 0);
 	if (mmf->filesize < offset) {
 		return 0;
 	}
@@ -261,8 +263,9 @@ void *mmf_mapping_offset_ptr(MemoryMappedFile *mmf, uint64_t offset)
 	return (char *)mmf->mapping + offset;
 }
 
-void mmf_write(MemoryMappedFile *mmf, uint64_t offset, char *data, uint64_t data_size)
+void mmf_write(MemoryMappedFile *mmf, int64_t offset, char *data, uint64_t data_size)
 {
+  assert(offset > 0);
 	if (mmf->mapping && mmf->access == MMFileAccess::WRITE) {
 		assert(mmf->mapping_size > offset);
 		mmf->filesize = max(offset + data_size, mmf->filesize);
@@ -313,25 +316,29 @@ typedef SubmissionQueueEntry CompletionQueueEntry;
 
 struct SubmissionQueue {
   SubmissionQueueEntry *entries;
-  ULONG head;
-  ULONG tail;
-  ULONG capacity;
+  ULONGLONG head;
+  ULONGLONG tail;
+  LONGLONG capacity;
 };
 
 typedef SubmissionQueue CompletionQueue;
 
 struct ASIOContext {
-  SubmissionQueue submission_queue;
-  CompletionQueue completion_queue;
+  SubmissionQueue *submission_queue;
+  CompletionQueue *completion_queue;
 };
 
-void platform_asio_create(ASIOContext *context, uint32_t max_threads = 1, size_t queue_size = 65536) {
-  auto queue_memory =
-    VirtualAlloc(0, queue_size * sizeof(SubmissionQueueEntry), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-  auto completion_queue_memory = VirtualAlloc(0, queue_size * sizeof(CompletionQueueEntry), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+typedef FILE_SEGMENT_ELEMENT BufferInfo;
 
-  context->submission_queue.capacity = queue_size;
-  context->completion_queue.capacity = queue_size;
+void platform_asio_create(ASIOContext *context, uint32_t max_threads = 1, size_t queue_size = 4096) {
+  auto queue_memory =
+    VirtualAlloc(0, sizeof(SubmissionQueue) + queue_size * sizeof(SubmissionQueueEntry), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+
+  context->submission_queue = (SubmissionQueue *)queue_memory;
+  context->completion_queue = (SubmissionQueue *)queue_memory;
+  context->submission_queue->entries = (SubmissionQueueEntry *)((uint8_t *)queue_memory + sizeof(SubmissionQueue));
+  context->submission_queue->capacity = queue_size;
+  context->completion_queue->capacity = queue_size;
 
   if (!queue_memory) {
     fprintf(stderr, "Failed to allocate enough memory for asio queues\n");
@@ -347,37 +354,40 @@ void platform_asio_create(ASIOContext *context, uint32_t max_threads = 1, size_t
    *
   */
 
-	context->submission_queue.entries = (SubmissionQueueEntry *)queue_memory; 
-  context->completion_queue.entries = (CompletionQueueEntry *)queue_memory; 
 }
 
 inline uint64_t _platform_get_asio_queue_slot_idx(uint64_t counting_index, uint64_t capacity) {
   return counting_index & (capacity - 1);
 }
 
-void platform_asio_submit_write(ASIOContext *context, OSHandle file_handle, uint64_t file_offset, void *buffer,
+bool platform_asio_submit_write(ASIOContext *context, OSHandle file_handle, uint64_t file_offset, void *buffer,
 																size_t buffer_size, uint64_t user_data)
 {
   assert(buffer_size % 4096 == 0); // must be a multiple of sector size
+  assert((uintptr_t)buffer % 4096  == 0);
+  assert(file_offset % 4096 == 0);
 	DWORD bytes_written = 0;
 
   auto &submission_queue = context->submission_queue;
 
-  if (submission_queue.tail - submission_queue.head >= submission_queue.capacity) {
-    auto head_of_queue_entry = &submission_queue.entries[_platform_get_asio_queue_slot_idx(submission_queue.head, submission_queue.capacity)];
-    assert(HasOverlappedIoCompleted(&head_of_queue_entry->overlapped) && head_of_queue_entry->active);
-    ++submission_queue.head;
+  if (submission_queue->tail - submission_queue->head >= submission_queue->capacity) {
+    auto head_of_queue_entry = &submission_queue->entries[_platform_get_asio_queue_slot_idx(submission_queue->head, submission_queue->capacity)];
+    if (HasOverlappedIoCompleted(&head_of_queue_entry->overlapped) && head_of_queue_entry->active) {
+      return false;
+    }
+    ++submission_queue->head;
   }
 
-  auto queue_slot = &submission_queue.entries[_platform_get_asio_queue_slot_idx(submission_queue.tail++, submission_queue.capacity)];
+  auto queue_slot = &submission_queue->entries[_platform_get_asio_queue_slot_idx(submission_queue->tail++, submission_queue->capacity)];
 
-  queue_slot->overlapped.Offset = 0xFFFFFFFF;
-  queue_slot->overlapped.OffsetHigh = 0xFFFFFFFF;
+  queue_slot->overlapped.Offset = file_offset & 0x00000000FFFFFFFF;
+  queue_slot->overlapped.OffsetHigh = (file_offset) >> 32;
   queue_slot->user_data = user_data;
   queue_slot->file_handle = file_handle;
   queue_slot->buffer_size = buffer_size;
   queue_slot->buffer = buffer;
   queue_slot->offset_to_write = file_offset;
+  queue_slot->active = true;
 
   auto result = WriteFile(
     (HANDLE)file_handle.os_handle,
@@ -386,12 +396,75 @@ void platform_asio_submit_write(ASIOContext *context, OSHandle file_handle, uint
     nullptr,
     &queue_slot->overlapped
   );
+
+  return true;
+}
+
+int64_t platform_asio_get_buffer_info_entry_count_from_buffer_size(size_t buffer_size) 
+{
+  assert(buffer_size % 4096 == 0);
+  return buffer_size / 4096;
+}
+void platform_asio_fill_multiple_buffer_info(BufferInfo *info, void *buffer, size_t count) 
+{
+  for (auto i = 0; i < count; ++i) {
+    auto buffer_ptr = (uint8_t *)buffer + 4096 * i;
+    info[i].Buffer = buffer_ptr;
+  }
+}
+
+void *platform_asio_get_buffer_from_info(BufferInfo *info) 
+{
+  return info->Buffer;
+}
+
+
+bool platform_asio_submit_write_buffer_info_array(ASIOContext *context, OSHandle file_handle, uint64_t file_offset,
+																									BufferInfo *buffer_array, size_t total_bytes_to_write,
+																									uint64_t user_data)
+{
+	{
+		assert(file_offset % 4096 == 0);
+		DWORD bytes_written = 0;
+
+		auto &submission_queue = context->submission_queue;
+
+		if (submission_queue->tail - submission_queue->head >= submission_queue->capacity) {
+			auto head_of_queue_entry =
+				&submission_queue->entries[_platform_get_asio_queue_slot_idx(submission_queue->head, submission_queue->capacity)];
+			if (HasOverlappedIoCompleted(&head_of_queue_entry->overlapped) && head_of_queue_entry->active) {
+				return false;
+			}
+			++submission_queue->head;
+		}
+
+		auto queue_slot =
+			&submission_queue->entries[_platform_get_asio_queue_slot_idx(submission_queue->tail++, submission_queue->capacity)];
+
+		queue_slot->overlapped.Offset = file_offset & 0x00000000FFFFFFFF;
+		queue_slot->overlapped.OffsetHigh = (file_offset) >> 32;
+		queue_slot->user_data = user_data;
+		queue_slot->file_handle = file_handle;
+		queue_slot->buffer_size = total_bytes_to_write;
+		queue_slot->buffer = buffer_array;
+		queue_slot->offset_to_write = file_offset;
+    queue_slot->active = true;
+
+		auto result = WriteFileGather((HANDLE)file_handle.os_handle, (FILE_SEGMENT_ELEMENT *)buffer_array, total_bytes_to_write, NULL, &queue_slot->overlapped);
+    auto err = GetLastError();
+    if (err != ERROR_IO_PENDING) {
+      return false;
+    }
+    
+
+		return true;
+	}
 }
 
 inline CompletionQueueEntry *platform_asio_completed_entry_dequeue(ASIOContext *context) {
   auto &completion_queue = context->completion_queue;
-	for (auto i = completion_queue.head; i < completion_queue.tail; ++i) {
-		auto queue_slot = &completion_queue.entries[_platform_get_asio_queue_slot_idx(i, completion_queue.capacity)];
+	for (auto i = completion_queue->head; i < completion_queue->tail; ++i) {
+		auto queue_slot = &completion_queue->entries[_platform_get_asio_queue_slot_idx(i, completion_queue->capacity)];
     auto bytes_transfered = 0;
     if (queue_slot->active && HasOverlappedIoCompleted(&queue_slot->overlapped)) {
       queue_slot->active = false;
@@ -408,4 +481,9 @@ uint64_t platform_asio_completed_entry_get_bytes_transfered(CompletionQueueEntry
                       FALSE); 
 
   return bytes_transfered;
+}
+
+void *page_allocator_alloc(size_t bytes) 
+{
+  return VirtualAlloc(0, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 }

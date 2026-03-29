@@ -12,7 +12,6 @@ struct DatabaseContext {
       MemoryMappedFile data_dict_file;
 
       ThreadSafeMap<TableID, MemoryMappedFile> table_meta_file_map;
-      PoolAllocator schema_maps_pool;
       SchemaCacheTrippleBuffer schema_maps_tripple_buffer;
       WriterQueues writer_queues;
 };

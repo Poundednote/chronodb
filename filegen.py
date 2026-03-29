@@ -23,9 +23,9 @@ elif filetype == "exist":
     with open("outfile.data", "w") as file_handler:
         for i in range(n_rows):
             if random.randint(0, 1):
-                line = f"table0 {i} [] testcolumn0={random.randint(0, 999)}, testcolumn1={random.randint(0, 999)}\n"
+                line = f"table0 {i} [] testcolumn0={random.randint(0, 999)}, testcolumn1={random.randint(0, 999)}, new_str_col='TESTSTRING'\n"
             else:
-                line = f"table0 {i} [] testcolumn0={random.randint(0, 999)}, newcol={random.randint(0, 999)}\n"
+                line = f"table0 {i} [] testcolumn0={random.randint(0, 999)}, newcol={random.randint(0, 999)}, new_str_col='TESTSTRING'\n"
             file_handler.write(line)
 
 elif filetype == "o3":
@@ -33,16 +33,17 @@ elif filetype == "o3":
         for i in range(n_rows):
             line = f"temperature {n_rows - i} [sensor=\"{random.choice(sensors)}\", site=\"B\", bomb='BBB'] degrees={random.randint(1, 99):02}, columnA={random.randint(1,99)/100}'\n"
             file_handler.write(line)
+
 elif filetype == "mixed":
     with open("outfile.data", "w") as file_handler:
         for i in range(n_rows):
             for t in tables:
                 line = f"{t} {n_rows - i} [sensor=\"{random.choice(sensors)}\", site=\"B\", bomb='BBB'] degrees=6969696, columnA=6969696'\n"
-            file_handler.write(line)
+                file_handler.write(line)
 
 elif filetype == "debug":
     with open("outfile.data", "w") as file_handler:
         for i in range(n_rows):
             for t in tables:
                 line = f"{t} 11420 [sensor=\"{random.choice(sensors)}\", site=\"B\", bomb='BBB'] degrees=6969696, columnA=6969696'\n"
-            file_handler.write(line)
+                file_handler.write(line)

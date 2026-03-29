@@ -78,7 +78,7 @@ void schema_maps_init(SchemaMaps *schema_maps, uint32_t table_capacity) {
 		table_capacity * MAX_COLUMNS * (sizeof(ColumnHashTableBucket) + sizeof(ColumnSlot));
 
 	// Double it and give it the next person
-	auto arena_capacity = table_schema_maps_size + column_arrays_size * 2; 
+	size_t arena_capacity = table_schema_maps_size + column_arrays_size * 2; 
 	arena_init(maps_arena, arena_capacity);
 	std::memset(maps_arena->memory, 0, arena_capacity);
 
@@ -370,15 +370,14 @@ void schema_maps_dec_refcount(SchemaCacheTrippleBuffer *maps, SchemaMapsResult m
 
 void thread_local_schema_maps_init(ThreadLocalSchemaMaps *schema_maps)
 {
-  *schema_maps = {};
+  std::memset(schema_maps, 0, sizeof(ThreadLocalSchemaMaps));
   auto arena = &schema_maps->arena;
 
 	arena_init(arena, TABLE_PAGE_MAP_SIZE + LOCAL_TABLE_PAGE_MAP_SIZE + TABLE_PAGES_SIZE + TABLE_REQUEST_INFO_SIZE +
 											ACTIVE_GLOBAL_TABLE_PAGES_SIZE);
 
-	pool_init(&schema_maps->data_page_pool, arena, DATA_PAGE_SIZE, TABLE_PAGE_LIMIT);
-	pool_init(&schema_maps->per_table_request_info_pool, arena, sizeof(PerTableRequestInfo), TABLE_PAGE_LIMIT);
-  pool_init(&schema_maps->data_page_and_metadata_pool, arena, sizeof(DataPageAndMetadata), TABLE_PAGE_LIMIT);
+	pool_init(&schema_maps->data_page_pool, arena, TABLE_PAGE_LIMIT, KILOBYTES(4));
+	pool_init(&schema_maps->per_table_request_info_pool, arena, TABLE_PAGE_LIMIT);
 
 	schema_maps->active_global_table_pages = arena_alloc_struct_array(arena, TableID, TABLE_PAGE_LIMIT);
 	schema_maps->table_page_map_array = arena_alloc_struct_array(arena, RequestInfoAndPage, MAX_TABLES);
@@ -390,21 +389,25 @@ void thread_local_schema_maps_init(ThreadLocalSchemaMaps *schema_maps)
 
 }
 
-DataPageAndMetadata *schema_maps_get_new_page_and_metadata(ThreadLocalSchemaMaps *schema_maps) 
+DataPage *schema_maps_get_new_page_and_metadata(ThreadLocalSchemaMaps *schema_maps) 
 {
-  auto data_page = (DataPage *)pool_atomic_alloc(&schema_maps->data_page_pool);
-  auto page_and_metadata = (DataPageAndMetadata *)pool_atomic_alloc(&schema_maps->data_page_and_metadata_pool);
-  data_page->header.column_count = 0;
-  page_and_metadata->metadata = {};
-  page_and_metadata->metadata.bytes_written = sizeof(DataPageHeader);
-  page_and_metadata->page = data_page;
-  return page_and_metadata;
+  auto data_page = pool_atomic_alloc(&schema_maps->data_page_pool, false); // its too big to warrant a full memset 0
+  auto data_page_header = (DataPageHeader *)data_page;
+  while (data_page == 0) {
+    yield_processor();
+    data_page = pool_atomic_alloc(&schema_maps->data_page_pool, false);
+  }
+  data_page_header->bytes_written = sizeof(DataPageHeader);
+  data_page_header->start_timestamp = 0;
+  data_page_header->end_timestamp = 0;
+  data_page_header->string_data_end = 0;
+  data_page_header->row_write_offset = sizeof(DataPageHeader);
+  return data_page;
 }
 
 PerTableRequestInfo *schema_maps_get_new_request_info(ThreadLocalSchemaMaps *schema_maps) 
 {
   auto request_info = (PerTableRequestInfo *)pool_atomic_alloc(&schema_maps->per_table_request_info_pool);
-  *request_info = {};
   request_info->strings_arena.memory = request_info->arena_backing;
   request_info->strings_arena.capacity = sizeof(request_info->arena_backing);
 
@@ -506,10 +509,10 @@ uint32_t get_data_size_from_col_type(ColumnDataType type)
 
 	case ColumnDataType::FLOAT:
 	case ColumnDataType::INT32:
-		return 4;
+		return 8;
 
 	case ColumnDataType::VARCHAR:
-		return 255;
+		return 4;
 	default:
 		return 0;
 	}

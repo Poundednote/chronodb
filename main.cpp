@@ -45,7 +45,7 @@ struct ProcessRequestArgs {
 struct FakeRequestHandleArgs {
 	DatabaseContext *context;
 	char *data;
-	uint64_t data_size;
+	int64_t data_size;
 	MemoryMappedFile data_dict_file;
 };
 
@@ -53,12 +53,12 @@ struct FakeRequestHandleArgs {
 WQ_TASK(fake_request_handle)
 {
 	FakeRequestHandleArgs *typed_args = (FakeRequestHandleArgs *)args;
-	DatabaseContext *context = typed_args->context;
-	char *data = typed_args->data;
-	uint64_t data_size = typed_args->data_size;
+	auto *context = typed_args->context;
+	auto *data = typed_args->data;
+	auto data_size = typed_args->data_size;
 	MemoryMappedFile data_dict_file = typed_args->data_dict_file;
 
-	uint64_t string_size = data_size;
+	auto string_size = data_size;
 	for (int i = data_size; i >= 0; --i) {
 		if (data[i] != '\n') {
 			--string_size;
@@ -173,7 +173,7 @@ int main(int argc, char *argv[])
 
   // init queues
 	MPMCWorkQueue io_queue = {};
-	mpmc_work_queue_init(&io_queue, &main_arena, 512);
+	mpmc_work_queue_init(&io_queue, &main_arena, 512, thread_count);
 
   for (auto &queue: db_context->writer_queues.queue_arr) {
     mpsc_writer_init(&queue, &main_arena, 64);
@@ -196,53 +196,51 @@ int main(int argc, char *argv[])
   double thread_time_acc[2] = {};
   double submission_time_acc = 0;
 
-  auto iterations = 1;
-  for (int i = 0; i < iterations; ++i) {
-		mpmc_begin_producer(&io_queue);
+  mpmc_begin_producer(&io_queue);
 
-		int max_chunks = 1000;
-		auto submision_start = platform_get_high_res_timer_stamp();
-		for (int i = 0; i < max_chunks; ++i) {
-			int chunk_size = filesize / max_chunks;
-			char *buffer_chunk_start = buffer + i * chunk_size;
-			MPMCWorkQueuePayload entry = {};
-			FakeRequestHandleArgs *args = arena_alloc_struct(&main_arena, FakeRequestHandleArgs);
-			args->data = buffer_chunk_start;
-			args->data_size = chunk_size;
-			args->data_dict_file = data_dict_file;
-			args->context = db_context;
+  int max_chunks = 4;
+  auto submission_start = platform_get_high_res_timer_stamp();
+  for (int iter = 0; iter < 100; ++iter) {
+    for (int i = 0; i < max_chunks; ++i) {
+      int chunk_size = filesize / max_chunks;
+      char *buffer_chunk_start = buffer + i * chunk_size;
+      MPMCWorkQueuePayload entry = {};
+      FakeRequestHandleArgs *args = arena_alloc_struct(&main_arena, FakeRequestHandleArgs);
+      args->data = buffer_chunk_start;
+      args->data_size = chunk_size;
+      args->data_dict_file = data_dict_file;
+      args->context = db_context;
 
-			entry.callback = fake_request_handle;
-			entry.callback_args = args;
-			mpmc_work_queue_enqueue_entry(&io_queue, entry);
-		}
+      entry.callback = fake_request_handle;
+      entry.callback_args = args;
+      mpmc_work_queue_enqueue_entry(&io_queue, entry);
+    }
+    mpmc_end_producer(&io_queue);
+  }
 
-		mpmc_end_producer(&io_queue);
-		mpmc_work_queue_spinlock_till_finished(&io_queue);
-		auto submission_end = platform_get_high_res_timer_stamp();
-		auto ms_total_work_time = compute_time_in_ms(submision_start, submission_end);
-    for (int thread = 0; thread < thread_count; ++thread) {
-      thread_time_acc[thread] += thread_context_array[thread].ms_time_taken;
-      if (0) {
-				arena_destroy(&thread_context_array[thread].schema_maps.arena);
-				arena_destroy(&thread_context_array[thread].transient_arena);
-				arena_init(&thread_context_array[thread].transient_arena, MEGABYTES(32));
-				thread_local_schema_maps_init(&thread_context_array[thread].schema_maps);
-			}
-		}
-
-    submission_time_acc += ms_total_work_time;
-	}
-
-  fprintf(stderr, "\n\nTotal time elapsed from submision start to end: %fms\n", submission_time_acc / iterations);
-  fprintf(stderr, "Avg time thread 0: %fms\n", thread_time_acc[0] / (double)iterations);
-  fprintf(stderr, "Avg time thread 1: %fms\n", thread_time_acc[1] / (double)iterations);
 	mpmc_work_queue_stop(&io_queue);
+	mpmc_work_queue_spinlock_till_finished(&io_queue);
 
+	writer_thread_context->stop_flag.store(true, std::memory_order::release);
+	while (!writer_thread_context->finished.load(std::memory_order::acquire)) {
+    writer_thread_context->finished.wait(writer_thread_context->finished);
+	}
 
 	for (int i = 0; i < thread_count; ++i) {
 		io_threads[i].join();
 	}
+
+  writer_thread->join();
+
+  for (int i = 0; i < thread_count; ++i) {
+    auto avg_diff = (double)thread_context_array[i].timer_diffs / (double)thread_context_array[i].run_count;
+    fprintf(stderr, "Avg time thread %d: %fms, runs: %I64d\n", i, ((double)avg_diff / (double)platform_high_res_timer_freq()) * 1000, thread_context_array[i].run_count);
+  }
+
+  auto avg_writer_diff = writer_thread_context->timer_diffs / writer_thread_context->run_count;
+  fprintf(stderr, "Avg writer thread time: %fms, runs: %I64d\n", ((double)avg_writer_diff / (double)platform_high_res_timer_freq()) * 1000, writer_thread_context->run_count);
+	fprintf(stderr, "\n\nTotal time elapsed from submision start to end: %fms, \n", compute_time_in_ms(submission_start, platform_get_high_res_timer_stamp()));
+
 
 	return 0;
 }

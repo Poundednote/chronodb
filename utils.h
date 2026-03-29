@@ -57,7 +57,7 @@ void dynamic_array_push(DynamicArray<T> *da, const T& item) {
 
 struct Arena {
 	void *memory;
-	volatile uint64_t size;
+	volatile int64_t size;
 	uint64_t capacity;
 };
 
@@ -66,7 +66,7 @@ void arena_init(Arena *a, uint32_t capacity)
 	a->size = 0;
 	a->capacity = capacity;
 
-	a->memory = malloc(capacity);
+	a->memory = page_allocator_alloc(capacity);
 	assert(a->memory != nullptr);
 }
 
@@ -118,50 +118,151 @@ void *arena_alloc_zero(Arena *a, uint64_t size, uint64_t alignment)
 
 #define arena_atomic_alloc_struct(a, struct) (struct *)arena_atomic_alloc(a, sizeof(struct), alignof(struct))
 #define arena_atomic_alloc_struct_array(a, struct, n) (struct *)arena_atomic_alloc(a, sizeof(struct) * n)
+template <typename T>
+/* NOTE(Ray):
+ * This pool allocator uses an SPSC free list array to track free entries instead of the more traditional linked list approach
+ * The array is initiliezed with pointers to the blocks and they are popped from the head. Its a queue so free entries just get added to the end
+ * in whatever order they get deallocated. This is used in the ingestion worker and writer thread to reduce MESI contention
+ * on the single head of the traditional pool allocators. Instead we have bassically 0 contention 
+ * because head and tail are on seperate lines we use a shadow tail to make sure we only check the queue is empty every once 
+ * in a while
+ *
+ *
+ *
+*/
+struct PoolAllocatorSPSCFreeList {
+  alignas(std::hardware_destructive_interference_size) std::atomic<uint64_t> head;
+  alignas(std::hardware_destructive_interference_size) std::atomic<uint64_t> shadow_tail;
+  alignas(std::hardware_destructive_interference_size) std::atomic<uint64_t> tail;
+  T **free_list_entries;
+  uint64_t block_count;
+  void *memory;
+};
+
+template <typename T>
+void pool_init(PoolAllocatorSPSCFreeList<T> *p, size_t block_count, void *memory, size_t memory_size) 
+{
+
+	assert((sizeof(T) * block_count) + (sizeof(void *) * block_count) <= memory_size);
+  assert(((block_count - 1) & block_count) == 0); // make sure pow 2 size
+  p->block_count = block_count;
+  p->memory = memory;
+  p->free_list_entries = (T **)((uint8_t *)memory + (sizeof(T) * block_count));
+	for (auto i = 0; i < block_count; ++i) {
+    T *memory_block = (T *)((uint8_t *)p->memory + (sizeof(T) * i));
+    p->free_list_entries[i] = memory_block;
+	}
+
+  p->shadow_tail = block_count;
+  p->tail.store(block_count, std::memory_order::release);
+
+}
+
+
+template <typename T>
+void pool_init(PoolAllocatorSPSCFreeList<T> *p, size_t block_count, size_t alignment = 8) 
+{
+	size_t memory_size = (sizeof(T) * block_count) + (sizeof(void *) * block_count);
+	void *memory = page_allocator_alloc(memory_size);
+
+	pool_init(p, block_count, memory, memory_size);
+}
+
+template <typename T>
+void pool_init(PoolAllocatorSPSCFreeList<T> *p, Arena *a, size_t block_count, size_t alignment = 8) 
+{
+	size_t memory_size = (sizeof(T) * block_count) + (sizeof(void *) * block_count);
+	auto memory = arena_alloc(a, memory_size, alignment);
+  pool_init(p, block_count, memory, memory_size);
+}
+
+
+template <typename T>
+T *pool_atomic_alloc(PoolAllocatorSPSCFreeList<T> *p, bool zeroed = true) 
+{
+  auto head = p->head.load(std::memory_order::relaxed);
+  if (head == p->shadow_tail) {
+    p->shadow_tail = p->tail.load(std::memory_order::acquire);
+    if (p->shadow_tail == head) {
+      return nullptr;
+    }
+  }
+
+  auto idx = (head & (p->block_count - 1));
+  auto ptr = p->free_list_entries[idx];
+  p->free_list_entries[idx] = (T *)0xFFFFFFFFFFFFFFFF;
+
+  p->head.fetch_add(1, std::memory_order::release);
+  if (zeroed) {std::memset(ptr, 0, sizeof(T));}
+  return ptr;
+}
+
+template <typename T>
+void pool_atomic_dealloc(PoolAllocatorSPSCFreeList<T> *p, void *ptr)
+{
+  auto tail = p->tail.load(std::memory_order::relaxed);
+  auto head = p->head.load(std::memory_order::acquire);
+  assert(tail - head < p->block_count);
+
+  auto idx = (tail & (p->block_count - 1));
+  assert(p->free_list_entries[idx] == (T *)0xFFFFFFFFFFFFFFFF);
+  p->free_list_entries[idx] = (T *)ptr;
+
+
+  p->tail.fetch_add(1, std::memory_order::release);
+}
 
 struct PoolAllocatorFreeListNode {
 	PoolAllocatorFreeListNode *next;
-  uint64_t sig;
+  uint32_t sig;
 };
 
+template <typename T>
 struct PoolAllocator {
 	alignas(16) PoolAllocatorFreeListNode *head;
 	int64_t generation;
 	void *memory;
 };
 
-void pool_init(PoolAllocator *p, size_t block_size, size_t block_count, void *memory, size_t memory_size) {
+template <typename T>
+void pool_init(PoolAllocator<T> *p, size_t block_count, void *memory, size_t memory_size) {
 
-	auto chunk_size = std::max(block_size, sizeof(PoolAllocatorFreeListNode *));
-	assert((block_size * block_count) <= memory_size);
+	auto chunk_size = std::max(sizeof(T), sizeof(PoolAllocatorFreeListNode *));
+	assert((chunk_size * block_count) <= memory_size);
 	p->memory = memory;
 
 	auto free_list_node = (PoolAllocatorFreeListNode *)p->memory;
 	p->head = free_list_node;
+  free_list_node->sig = 0xFEFEFEFE;
 	for (auto i = 1; i < block_count - 1; ++i) {
 		free_list_node->next = (PoolAllocatorFreeListNode *)((uint8_t *)p->memory + chunk_size * i);
 		free_list_node = free_list_node->next;
+    free_list_node->sig = 0xFEFEFEFE;
 	}
 
 	free_list_node->next = nullptr;
 	
 }
 
-void pool_init(PoolAllocator *p, size_t block_size, size_t block_count) {
-	size_t memory_size = (std::max(block_size, sizeof(PoolAllocatorFreeListNode))) * block_count;
-	void *memory = malloc(memory_size);
 
-	pool_init(p, block_size, block_count, memory, memory_size);
+template <typename T>
+void pool_init(PoolAllocator<T> *p, size_t block_count) {
+	size_t memory_size = (std::max(sizeof(T), sizeof(PoolAllocatorFreeListNode))) * block_count;
+	void *memory = page_allocator_alloc(memory_size);
+
+	pool_init(p, block_count, memory, memory_size);
 }
 
-void pool_init(PoolAllocator *p, Arena *a, size_t block_size, size_t block_count) {
-	size_t memory_size = block_size * block_count;
+template <typename T>
+void pool_init(PoolAllocator<T> *p, Arena *a, size_t block_count) {
+	size_t memory_size = std::max(sizeof(T), sizeof(PoolAllocatorFreeListNode)) * block_count;
 	assert((memory_size) <= a->capacity - a->size);
 	auto memory = arena_alloc(a, memory_size);
-  pool_init(p, block_size, block_count, memory, memory_size);
+  pool_init(p, block_count, memory, memory_size);
 }
 
-void *pool_alloc(PoolAllocator *p)
+template <typename T>
+T *pool_alloc(PoolAllocator<T> *p, bool zeroed=true)
 {
 	if (!p->head)
 		return nullptr;
@@ -170,10 +271,14 @@ void *pool_alloc(PoolAllocator *p)
 	p->head = p->head->next;
 	p->generation++;
 
-	return block;
+ // memset the thing here i've been screwed over by stale data before 
+  if (zeroed) { std::memset(block, 0, sizeof(T)); }
+
+	return (T *)block;
 }
 
-void *pool_atomic_alloc(PoolAllocator *p) {
+template <typename T>
+__declspec(noinline) T *pool_atomic_alloc(PoolAllocator<T> *p, bool zeroed=true) {
 
   /* NOTE(Ray)
     * The compiler only requires 8 bit alignment for these array fields, but cmpxchng16b requires 
@@ -186,31 +291,31 @@ void *pool_atomic_alloc(PoolAllocator *p) {
 	for (;;) {
 		PoolAllocatorFreeListNode* node_ptr = reinterpret_cast<PoolAllocatorFreeListNode*>(block[0]);
 		if (!node_ptr) {
-      __debugbreak();
 			return nullptr;
 		}
 
 		alignas(16) uint64_t next_head[2];
 		next_head[0] = reinterpret_cast<uint64_t>(node_ptr->next);
-    node_ptr->sig = 0xFEFEFEFE;
 		next_head[1] = block[1] + 1;
 
-		if (atomic_compare_and_swap_128_acq(&p->head, next_head[1], next_head[0], block)) {
-			return node_ptr; 
-		} else {
-			cpu_pause();
-		}
+		if (atomic_compare_and_swap_128_acq_rel(&p->head, next_head[1], next_head[0], block)) {
+      node_ptr->sig = 0;
+      if (zeroed) {std::memset(node_ptr, 0, sizeof(T));}
+			return (T *)node_ptr; 
+		} 
 	}
 }
 
-void pool_dealloc(PoolAllocator *p, void *ptr)
+template <typename T>
+void pool_dealloc(PoolAllocator<T> *p, void *ptr)
 {
 	auto block = (PoolAllocatorFreeListNode *)ptr;
 	block->next = p->head;
 	p->head = block;
 }
 
-__declspec(noinline) void pool_atomic_dealloc(PoolAllocator *p, void *ptr) {
+template <typename T>
+void pool_atomic_dealloc(PoolAllocator<T> *p, void *ptr) {
 	auto node_to_free = reinterpret_cast<PoolAllocatorFreeListNode*>(ptr);
 
 	alignas(16) uint64_t expected_head[2] = {};
@@ -221,13 +326,18 @@ __declspec(noinline) void pool_atomic_dealloc(PoolAllocator *p, void *ptr) {
 		alignas(16) uint64_t block[2];
 		block[0] = reinterpret_cast<uint64_t>(ptr);
 		block[1] = expected_head[1] + 1;
+    if (node_to_free->sig == 0xFEFEFEFE) {
+      assert(false);
+      __debugbreak();
+    }
 
-		if (atomic_compare_and_swap_128_rel(&p->head, block[1],
+
+		if (atomic_compare_and_swap_128_acq_rel(&p->head, block[1],
 						    block[0], expected_head)) {
+      node_to_free->sig = 0xFEFEFEFE;
 			return;
 		}
 	}
-
 }
 
 struct String8;
@@ -306,7 +416,7 @@ template <typename T> int64_t __string_to_int_template(T s)
 }
 
 template <typename T>
-T __string_slice_length_template(T s, uint32_t start_index, uint32_t length = 0)
+T __string_slice_length_template(T s, int64_t start_index, int64_t length = 0)
 {
 	assert(start_index < s.length);
 	T result = s;
@@ -448,7 +558,7 @@ StringSlice8 string_slice_length(String8 s, int64_t start_index = 0,
 		*(StringSlice8 *)&s, start_index, length);
 }
 
-StringSlice8 string_slice_length(StringSlice8 s, int start_index = 0,
+StringSlice8 string_slice_length(StringSlice8 s, int64_t start_index = 0,
 				 int64_t length = 0)
 {
 	return __string_slice_length_template<StringSlice8>(
@@ -712,7 +822,7 @@ template <MapKey K, typename V>
 struct ThreadSafeMap {
 	ThreadSafeMapBucket<K, V> *buckets;
 	int64_t bucket_count;
-	PoolAllocator *a; // make clear that pool is owned by map
+	PoolAllocator<ThreadSafeMapBucket<K, V>> *a; // make clear that pool is owned by map
 
 	void insert(const K &k, const V &v)
 	{
@@ -860,7 +970,7 @@ struct ThreadSafeMap {
 };
 
 template <MapKey K, typename V>
-void thread_safe_map_init(ThreadSafeMap<K, V> *m, PoolAllocator *a, size_t buckets)
+void thread_safe_map_init(ThreadSafeMap<K, V> *m, PoolAllocator<ThreadSafeMap<K, V>> *a, size_t buckets)
 {
 	m->a = a;
 	m->bucket_count = buckets;
@@ -873,18 +983,14 @@ void thread_safe_map_init(ThreadSafeMap<K, V> *m, PoolAllocator *a, size_t bucke
 template <MapKey K, typename V>
 void thread_safe_map_init(ThreadSafeMap<K, V> *m, Arena *a, size_t buckets) 
 {
-	auto p = arena_alloc_struct(a, PoolAllocator);
-	size_t bucket_size = sizeof(*m->buckets);
-	size_t max_pool_blocks = buckets * 2;
-	size_t pool_memory_size = max_pool_blocks * bucket_size;
-	void *pool_memory = arena_alloc(a, pool_memory_size);
-	pool_init(p, bucket_size, max_pool_blocks, pool_memory, pool_memory_size);
+	auto p = (PoolAllocator<ThreadSafeMapBucket<K, V>> *)arena_alloc(a, sizeof(PoolAllocator<ThreadSafeMapBucket<K, V>>));
+	pool_init(p, a, buckets);
 
 	m->a = p;
 	m->bucket_count = buckets;
-	m->buckets = (ThreadSafeMapBucket<K, V> *)pool_alloc(p);
+	m->buckets = pool_alloc<ThreadSafeMapBucket<K, V>>(p);
 	for (auto i = 1; i < buckets; ++i) {
-		pool_alloc(p);
+		pool_alloc<ThreadSafeMapBucket<K, V>>(p);
 
 	}
 }
@@ -913,7 +1019,7 @@ template <MapKey K, typename V>
 struct HashMapClosedAddr {
 	HashMapBucket<K, V> *buckets;
 	int64_t bucket_count;
-	PoolAllocator *a; // make clear that pool is owned by map
+	PoolAllocator<HashMapBucket<K, V>> *a; // make clear that pool is owned by map
 
 	V *insert(const K &k, const V &v)
 	{
@@ -956,7 +1062,7 @@ struct HashMapClosedAddr {
 	}
 
 	
-HashMapClosedAddrInsertOrGetResult<V> insert_or_get(const K &k, const V &v) 
+  HashMapClosedAddrInsertOrGetResult<V> insert_or_get(const K &k, const V &v) 
 	{
 		auto hash = std::hash<K>{}(k);
 		auto idx = hash % this->bucket_count;
@@ -1075,11 +1181,11 @@ HashMapClosedAddrInsertOrGetResult<V> insert_or_get(const K &k, const V &v)
 };
 
 template <MapKey K, typename V>
-void hash_map_init(HashMapClosedAddr<K, V> *m, PoolAllocator *a, size_t buckets)
+void hash_map_init(HashMapClosedAddr<K, V> *m, PoolAllocator<HashMapBucket<K, V>> *a, size_t buckets)
 {
 	m->a = a;
 	m->bucket_count = buckets;
-	m->buckets = (HashMapBucket<K, V> *)pool_alloc(a);
+	m->buckets = pool_alloc<HashMapBucket<K, V>>(a);
 	for (auto i = 1; i < buckets; ++i) {
 		pool_alloc(a);
 	}
@@ -1097,9 +1203,9 @@ void hash_map_init(HashMapClosedAddr<K, V> *m, Arena *a, size_t buckets)
 
 	m->a = p;
 	m->bucket_count = buckets;
-	m->buckets = (HashMapBucket<K, V> *)pool_alloc(p);
+	m->buckets = pool_alloc<HashMapBucket<K, V>>(p);
 	for (auto i = 1; i < buckets; ++i) {
-		pool_alloc(p);
+		pool_alloc<HashMapBucket<K, V>>(p);
 	}
 }
 

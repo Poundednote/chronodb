@@ -103,7 +103,7 @@ void memory_map_file_handle_read_only(MemoryMappedFile *mmf, FileHandle handle, 
     if (filesize == 0) {
         struct stat st;
         fstat(fd, &st);
-        filesize = (uint64_t)st.st_size;
+        filesize = (int64_t)st.st_size;
     }
 
     void *file_memory = mmap(NULL, filesize, PROT_READ, MAP_PRIVATE, fd, 0);

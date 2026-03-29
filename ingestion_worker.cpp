@@ -25,16 +25,7 @@ inline bool parse_double(char* str, char* end_ptr, double* out_value) {
 }
 
 #else
-void ingestion_worker_start_routine(DatabaseContext *db_context, IngestionWorkerContext *t_ctx, uint16_t thread_id,
-																		MPMCWorkQueue *wq)
-{
-	t_ctx->thread_id = thread_id;
-
-  t_ctx->prev_timestamp = platform_get_high_res_timer_stamp();
-	while (!wq->stop_flag.load(std::memory_order::acquire)) {
-		mpmc_work_queue_dequeue_entry(t_ctx, wq);
-
-    if (compute_time_in_ms(t_ctx->prev_timestamp, platform_get_high_res_timer_stamp()) > 10) {
+void ingestion_worker_submit_buffered_work_to_writer_and_clear_local_maps(DatabaseContext *db_context, IngestionWorkerContext *t_ctx) {
       auto active_global_table_id_arr = t_ctx->schema_maps.active_global_table_pages;
       auto global_pages = t_ctx->schema_maps.table_page_map_array;
       for (auto i = 0; i < t_ctx->schema_maps.active_global_table_pages_count; ++i) {
@@ -43,9 +34,8 @@ void ingestion_worker_start_routine(DatabaseContext *db_context, IngestionWorker
         entry.table_id = id;
         entry.request_info_and_page = global_pages[id.index];
         entry.thread_id = t_ctx->thread_id;
-
-
-        writer_queues_enqueue_entry(&db_context->writer_queues, entry);
+        assert(((DataPageHeader *)entry.request_info_and_page.current_page)->next_page == 0);
+        writer_queues_enqueue_entry(&db_context->writer_queues, &entry);
       }
 
       std::memset(t_ctx->schema_maps.table_page_map_array, 0, TABLE_PAGE_MAP_SIZE);
@@ -59,16 +49,44 @@ void ingestion_worker_start_routine(DatabaseContext *db_context, IngestionWorker
         entry.request_info_and_page = local_pages.info_and_page_arr[actual_idx];
         entry.thread_id = t_ctx->thread_id;
 
-        writer_queues_enqueue_entry(&db_context->writer_queues, entry);
+        assert(((DataPageHeader *)entry.request_info_and_page.current_page)->next_page == 0);
+        writer_queues_enqueue_entry(&db_context->writer_queues, &entry);
       }
 
       t_ctx->prev_timestamp = platform_get_high_res_timer_stamp();
 
       std::memset(local_pages.buckets, 0, sizeof(LocalTablePageMapBucket) * local_pages.capacity);
-      std::memset(local_pages.info_and_page_arr, 0, sizeof(RequestInfoAndPage) * t_ctx->schema_maps.table_id_count);
+      std::memset(local_pages.info_and_page_arr, 0, sizeof(RequestInfoAndPage) * local_pages.capacity);
       t_ctx->schema_maps.table_id_count = 0;
-    }
+}
+
+void ingestion_worker_do_work_and_submit_to_writer_periodically(DatabaseContext *db_context, IngestionWorkerContext *t_ctx, MPMCWorkQueue *wq) 
+{
+	mpmc_work_queue_dequeue_entry(t_ctx, wq);
+
+	if (compute_time_in_ms(t_ctx->prev_timestamp, platform_get_high_res_timer_stamp()) > 10) {
+		ingestion_worker_submit_buffered_work_to_writer_and_clear_local_maps(db_context, t_ctx);
 	}
+}
+
+void ingestion_worker_start_routine(DatabaseContext *db_context, IngestionWorkerContext *t_ctx, uint16_t thread_id,
+																		MPMCWorkQueue *wq)
+{
+	t_ctx->thread_id = thread_id;
+
+  t_ctx->prev_timestamp = platform_get_high_res_timer_stamp();
+	while (!wq->stop_flag.load(std::memory_order::acquire)) {
+    ingestion_worker_do_work_and_submit_to_writer_periodically(db_context, t_ctx, wq);
+	}
+
+
+  while (wq->head.load(std::memory_order::acquire) != wq->tail.load(std::memory_order::acquire)) {
+    ingestion_worker_do_work_and_submit_to_writer_periodically(db_context, t_ctx, wq);
+  }
+
+  ingestion_worker_submit_buffered_work_to_writer_and_clear_local_maps(db_context, t_ctx);
+  wq->stop_count.fetch_add(1, std::memory_order::release);
+  wq->stop_count.notify_all();
 }
 
 inline bool parse_double(const char *str, char *end_ptr, double *out_value)
@@ -113,19 +131,19 @@ ParseValueResult parse_string(StringSlice8 string)
 {
 	ParseValueResult result = {};
 	result.type = ColumnDataType::VARCHAR;
-	result.data.varchar.content = string.content;
+	result.data.varchar.content = string.content + 1;
 	bool double_quote = string[0] == '"';
-	for (auto i = 0; i < string.length; ++i) {
+	for (auto i = 1; i < string.length; ++i) {
 		if (string[i] == '\n') {
 			result.err_msg = string8_from_cstring("Unterminated string literal");
 			return result;
 		}
 
 		if (double_quote && string[i] == '"') {
-			result.data.varchar.length = i + 1;
+			result.data.varchar.length = i - 1;
 			return result;
 		} else if (!double_quote && string[i] == '\'') {
-			result.data.varchar.length = i + 1;
+			result.data.varchar.length = i - 1;
 			return result;
 		}
 	}
@@ -222,7 +240,7 @@ TagsList parse_tags(Arena *a, StringSlice8 tags)
 
 	// join the array without the comma
 	//
-	uint64_t final_tags_size = 0;
+	int64_t final_tags_size = 0;
 	for (auto i = 0; i < result.n_tags; ++i) {
 		final_tags_size += result.tags[i].length;
 	}
@@ -391,15 +409,20 @@ void write_parsed_data(ThreadLocalSchemaMaps *schema_maps, uint64_t timestamp, R
 											 ParseColumnResultList parsed_columns)
 {
   // calculate row size
-  auto request_info = request_info_and_page->request_info;
-  auto page_and_metadata = request_info_and_page->current_page;
 
   uint64_t maximum_offset = 0; // theoretically can have a uint16_t but need the 64 for alignment
   uint64_t max_offset_data_size = 0;
+  auto request_info = request_info_and_page->request_info;
+  auto string_data = 0;
   for (int i = 0; i < parsed_columns.n_results; ++i) {
     auto &parsed_column = parsed_columns.results[i];
     auto &cache_entry = cache.entries[i];
     auto data_size = std::max(8u, get_data_size_from_col_type(parsed_column.type));
+
+    if (parsed_column.type == ColumnDataType::VARCHAR) {
+      string_data += parsed_column.data.varchar.length + 8; // bytes to write plus the length
+    }
+
     auto offset = request_info->column_offsets[get_offset_idx_from_id(cache_entry.column_id)] + sizeof(uint64_t);
 
 		if (maximum_offset < offset) {
@@ -407,30 +430,34 @@ void write_parsed_data(ThreadLocalSchemaMaps *schema_maps, uint64_t timestamp, R
       max_offset_data_size = data_size;
 		}
   }
+  
+  maximum_offset = maximum_offset + max_offset_data_size;
+  max_offset_data_size = 8;
+  auto bytes_to_write = maximum_offset + max_offset_data_size + string_data;
 
-
-
-  auto current_page_and_metadata_ptr = &request_info_and_page->current_page;
-	if ((*current_page_and_metadata_ptr)->metadata.bytes_written + maximum_offset + max_offset_data_size >= DATA_PAGE_SIZE) {
-		(*current_page_and_metadata_ptr)->next = schema_maps_get_new_page_and_metadata(schema_maps);
-		*current_page_and_metadata_ptr = (*current_page_and_metadata_ptr)->next;
+  auto current_page_ptr = &request_info_and_page->current_page;
+  auto current_header = (DataPageHeader *)(*current_page_ptr);
+	if (current_header->bytes_written + bytes_to_write >= DATA_PAGE_SIZE) {
+		*current_page_ptr = schema_maps_get_new_page_and_metadata(schema_maps);
+		current_header->next_page = reinterpret_cast<uint64_t>(*current_page_ptr);
+    current_header = (DataPageHeader *)request_info_and_page->current_page;
+    current_header->next_page = 0; // zero this out since the header is not zeroed by default
 	}
 
-  auto &metadata = request_info_and_page->current_page->metadata;
+	auto current_page = request_info_and_page->current_page;
 
-  if (!metadata.start_timestamp) {
-    metadata.start_timestamp = timestamp;
+  if (!current_header->start_timestamp) {
+    current_header->start_timestamp = timestamp;
   }
 
-  if (metadata.end_timestamp > timestamp) {
-    metadata.is_out_of_order = true;
+  if (current_header->end_timestamp > timestamp) {
+    current_header->is_out_of_order = true;
   } else {
-    metadata.end_timestamp = timestamp;  // always set the end timstamp to the latest even for out of order data
+    current_header->end_timestamp = timestamp;  // always set the end timstamp to the latest even for out of order data
   }
 
-	auto current_page = request_info_and_page->current_page->page;
 
-  auto write_ptr = (uint8_t *)(current_page) + metadata.bytes_written;
+  auto write_ptr = (uint8_t *)(current_page) + current_header->row_write_offset;
   assert((uint64_t)write_ptr % 8 == 0);
   *((uint64_t *)(write_ptr)) = maximum_offset + max_offset_data_size;
 	for (int i = 0; i < parsed_columns.n_results; ++i) {
@@ -458,16 +485,27 @@ void write_parsed_data(ThreadLocalSchemaMaps *schema_maps, uint64_t timestamp, R
 		case ColumnDataType::INT64:
 			std::memcpy(col_ptr, &parsed_column.data.int64, data_size);
 			break;
-		case ColumnDataType::VARCHAR:
-			std::memcpy(col_ptr, &parsed_column.data.varchar, data_size);
-			break;
+		case ColumnDataType::VARCHAR: {
+      auto string_start_offset = (DATA_PAGE_SIZE - current_header->string_data_end) - (parsed_column.data.varchar.length + 8);
+			std::memcpy(col_ptr, &string_start_offset, data_size);
+      auto string_start_ptr = (current_page->data + string_start_offset);
+      *((int64_t *)(string_start_ptr)) = parsed_column.data.varchar.length;
+      string_start_ptr += 8;
+      std::memcpy(string_start_ptr, parsed_column.data.varchar.content, parsed_column.data.varchar.length);
+      current_header->string_data_end += (parsed_column.data.varchar.length + 8);
+    } break;
 		default:
 			break;
 		}
 	}
+  
+  auto timestamp_ptr = (uint64_t *)(write_ptr + maximum_offset);
+  *timestamp_ptr = timestamp;
 
-  metadata.bytes_written += maximum_offset + max_offset_data_size;
-  assert(metadata.bytes_written <= DATA_PAGE_SIZE);
+  current_header->bytes_written += bytes_to_write;
+  current_header->row_write_offset += maximum_offset + max_offset_data_size;
+  request_info->row_count++;
+  assert(current_header->bytes_written <= DATA_PAGE_SIZE);
 }
 
 void *process_write_request(IngestionWorkerContext *t_ctx, DatabaseContext *context, String8 data_to_write)
@@ -497,7 +535,7 @@ void *process_write_request(IngestionWorkerContext *t_ctx, DatabaseContext *cont
 		}
 
     bool is_full_line_to_parse = false;
-    for (int i = tokeniser.at - (char *)data_to_write.content; i < data_to_write.length; ++i) {
+    for (int i = (ptrdiff_t)(tokeniser.at - (char *)data_to_write.content); i < data_to_write.length; ++i) {
       if (data_to_write.content[i] == '\n') {
         is_full_line_to_parse = true;
         break;
@@ -575,10 +613,15 @@ void *process_write_request(IngestionWorkerContext *t_ctx, DatabaseContext *cont
 			// table exists can just use the schema_maps for lookups
 			auto page_and_info = table_page_map_lookup(local_schema_maps, table_id);
       auto request_info = page_and_info->request_info;
+
+
 			if (!page_and_info->page_head) {
 				page_and_info = table_page_map_insert_new_page_and_info(local_schema_maps, table_id);
         request_info = page_and_info->request_info;
 				request_info->table_schema_version = schema_maps_lookup_table_schema_by_id(global_schema_maps, table_id)->version;
+
+				request_info->table_name.length = table_name.length;
+				std::memcpy(request_info->table_name.buffer, table_name.content, table_name.length);
 
 				for (int i = 0; i < parsed_columns_array.n_results; ++i) {
 					auto &parsed_column = parsed_columns_array.results[i];
@@ -602,6 +645,7 @@ void *process_write_request(IngestionWorkerContext *t_ctx, DatabaseContext *cont
 
 			} else {
 				request_info->table_schema_version = schema_maps_lookup_table_schema_by_id(global_schema_maps, table_id)->version;
+        assert(request_info->table_name.length > 0);
 
 				for (int i = 0; i < parsed_columns_array.n_results; ++i) {
 					auto &parsed_column = parsed_columns_array.results[i];
@@ -626,6 +670,11 @@ void *process_write_request(IngestionWorkerContext *t_ctx, DatabaseContext *cont
             }
 
             insert_col_info_to_row_cache_at_index(&prev_row_col_cache, table_id, column_id, parsed_column, i);
+            // if column isn't yet in request info 
+            if (request_info->global_column_ids[column_id.index].id == 0) {
+              request_info->global_column_ids[column_id.index] = column_id;
+              request_info_assign_offset(request_info, column_id, parsed_column.type);
+            }
 
 					} else {
             ColumnDataType data_type{};
@@ -661,10 +710,7 @@ cleanup:
 	arena_clear(&t_ctx->transient_arena);
   
 	auto time_end = platform_get_high_res_timer_stamp();
-	double ms_time_taken = ((double)(time_end - time_start) / (double)platform_high_res_timer_freq()) * 1000;
-  t_ctx->ms_time_taken = ms_time_taken;
-
-	fprintf(stderr, "Thread %d: Ingested %d rows, time taken %f ms\n", t_ctx->thread_id, row_count, ms_time_taken);
-	fprintf(stderr, "Timestamp start: %llu, Timestamp end: %llu\n", time_start, time_end);
+  t_ctx->timer_diffs += time_end - time_start;
+  t_ctx->run_count += 1;
 	return 0;
 }
