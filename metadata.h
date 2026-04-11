@@ -8,7 +8,7 @@
 static constexpr auto MAX_TABLES = 16384;
 static constexpr auto DEFAULT_TABLE_CAPACITY = 512u;
 static constexpr auto TABLE_PAGE_LIMIT = 8192;
-static constexpr auto DATA_PAGE_LIMIT = 16384;
+static constexpr auto DATA_PAGE_LIMIT = 16384 / 2;
 static constexpr auto PER_REQUEST_INFO_LIMIT = 256;
 static constexpr auto LOCAL_TABLE_PAGE_MAP_LIMIT = 512;
 static constexpr auto MAX_COLUMNS = 1024;

@@ -13,19 +13,17 @@ IF "%1" == "tests" (
   .\build\test_generation.exe
   python filegen.py exist
   .\build\main.exe 1
-  rm .\TEST_DB\tables\table0\active_partition.data
+  del .\TEST_DB\tables\table0\active_partition.data
   .\build\main.exe 2
-  rm .\TEST_DB\tables\table0\active_partition.data
+  del .\TEST_DB\tables\table0\active_partition.data
   .\build\main.exe 3
-  rm .\TEST_DB\tables\table0\active_partition.data
+  del .\TEST_DB\tables\table0\active_partition.data
   .\build\main.exe 4
-  rm .\TEST_DB\tables\table0\active_partition.data
+  del .\TEST_DB\tables\table0\active_partition.data
   .\build\main.exe 5
-  rm .\TEST_DB\tables\table0\active_partition.data
+  del .\TEST_DB\tables\table0\active_partition.data
   .\build\main.exe 6
-  rm .\TEST_DB\tables\table0\active_partition.data
+  del .\TEST_DB\tables\table0\active_partition.data
 ) ELSE (
-	cl %CommonCompilerFlags% /O2 main.cpp 
+	cl %CommonCompilerFlags% /Od main.cpp 
 )
-
-

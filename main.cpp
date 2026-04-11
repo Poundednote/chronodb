@@ -104,7 +104,7 @@ int main(int argc, char *argv[])
   FILE *outfile = 0;
   fopen_s(&outfile, "out.txt", "ab");
 	Arena main_arena;
-	arena_init(&main_arena, GIGABYTES(1) * thread_count);
+	arena_init(&main_arena, GIGABYTES(1));
 
 	DatabaseContext *db_context = arena_alloc_struct(&main_arena, DatabaseContext);
 	// init maps
