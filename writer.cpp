@@ -77,10 +77,14 @@ SchemaMaps *copy_old_map_to_new_slot(SchemaCacheTrippleBuffer *maps)
   return new_map;
 }
 
-void process_completed_writes(ASIOContext *asio_context, HotPartitionInfo *hot_partition_info_map, PoolAllocator<BatchedIOInfo> *batched_info_pool, IngestionWorkerContext *iw_ctx_arr) 
+bool process_completed_writes(ASIOContext *asio_context, HotPartitionInfo *hot_partition_info_map, PoolAllocator<BatchedIOInfo> *batched_info_pool, IngestionWorkerContext *iw_ctx_arr) 
 {
-  for (auto entry = platform_asio_completed_entry_dequeue(asio_context);
-       entry != nullptr; entry = platform_asio_completed_entry_dequeue(asio_context)) {
+  auto entry = platform_asio_completed_entry_dequeue(asio_context);
+  if (!entry) {
+    return true;
+  }
+
+  for (;entry != nullptr; entry = platform_asio_completed_entry_dequeue(asio_context)) {
     if (entry->buffer_size != platform_asio_completed_entry_get_bytes_transfered(entry)) {
       // try again
 			platform_asio_submit_write_buffer_info_array(asio_context, entry->file_handle, entry->offset,
@@ -106,6 +110,8 @@ void process_completed_writes(ASIOContext *asio_context, HotPartitionInfo *hot_p
 			pool_dealloc(batched_info_pool, batched_io_info);
     }
   }
+
+  return false;
 }
 
 
@@ -455,6 +461,7 @@ void writer_queue_start_routine(DatabaseContext *db_context, WriterContext *writ
     if (should_swap) {
       writer_queues_advance_version_and_process_queue(db_context, writer_context);
     }
+    while(!process_completed_writes(&writer_context->asio_context, db_context->hot_partition_file_handles, &writer_context->batched_info_pool, db_context->thread_context_array));
 	}
 
   writer_context->finished.store(true, std::memory_order::release);

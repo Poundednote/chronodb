@@ -228,7 +228,6 @@ int main(int argc, char *argv[])
 	mpmc_work_queue_stop(&io_queue);
 	mpmc_work_queue_spinlock_till_finished(&io_queue);
 
-  Sleep(10000);
 
 	writer_thread_context->stop_flag.store(true, std::memory_order::release);
 	while (!writer_thread_context->finished.load(std::memory_order::acquire)) {
