@@ -5,8 +5,27 @@ set CommonCompilerFlags=/Fobuild\ /Febuild\ /Fdbuild\ /GR- /Zi /std:c++20 /MT /O
 IF "%1" == "tests" (
 	cl %CommonCompilerFlags% test_generation.cpp 
 ) ELSE IF "%1" == "reader" (
-  cl %CommonCompilerFlags% /Od reader.cpp 
+  cl %CommonCompilerFlags% /O2 reader.cpp 
+) ELSE IF "%1" == "run-all" (
+	cl %CommonCompilerFlags% test_generation.cpp 
+	cl %CommonCompilerFlags% /O2 main.cpp 
+  mkdir TEST_DB
+  .\build\test_generation.exe
+  python filegen.py exist
+  .\build\main.exe 1
+  rm .\TEST_DB\tables\table0\active_partition.data
+  .\build\main.exe 2
+  rm .\TEST_DB\tables\table0\active_partition.data
+  .\build\main.exe 3
+  rm .\TEST_DB\tables\table0\active_partition.data
+  .\build\main.exe 4
+  rm .\TEST_DB\tables\table0\active_partition.data
+  .\build\main.exe 5
+  rm .\TEST_DB\tables\table0\active_partition.data
+  .\build\main.exe 6
+  rm .\TEST_DB\tables\table0\active_partition.data
 ) ELSE (
-	cl %CommonCompilerFlags% /Od main.cpp 
+	cl %CommonCompilerFlags% /O2 main.cpp 
 )
+
 

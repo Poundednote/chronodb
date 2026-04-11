@@ -18,15 +18,15 @@ void mpmc_work_queue_init(MPMCWorkQueue *wq, Arena *a, uint32_t work_capacity, i
 
 }
 
-void mpmc_work_queue_dequeue_entry(IngestionWorkerContext *t_ctx, MPMCWorkQueue *wq)
+__declspec(noinline) void mpmc_work_queue_dequeue_entry(IngestionWorkerContext *t_ctx, MPMCWorkQueue *wq)
 {
 	uint64_t head = wq->head.load(std::memory_order::relaxed);
 	uint64_t next_head_index = head + 1;
-	uint64_t tail = wq->tail.load(std::memory_order::relaxed);
 
-	if (head < wq->tail.load(std::memory_order::acquire)) {
+	uint64_t tail = wq->tail.load(std::memory_order::acquire);
+	if (head < tail) {
 		bool success = wq->head.compare_exchange_strong(
-			head, next_head_index, std::memory_order::acq_rel,
+			head, next_head_index, std::memory_order::acquire,
 			std::memory_order::relaxed);
 
 		if (success) {
@@ -47,7 +47,6 @@ void mpmc_work_queue_dequeue_entry(IngestionWorkerContext *t_ctx, MPMCWorkQueue 
     if (wq->stop_flag.load(std::memory_order::acquire)) {
       return;
     }
-		uint64_t tail = wq->tail.load(std::memory_order::relaxed);
 		wq->tail.wait(tail); // wait while tail is the same
 	}
 }
@@ -71,7 +70,7 @@ void mpmc_work_queue_enqueue_entry(MPMCWorkQueue *wq, MPMCWorkQueuePayload paylo
 
 	for (;;) {
 		uint64_t tail = wq->tail.load(std::memory_order::relaxed);
-		uint64_t head = wq->head.load(std::memory_order::acquire);
+    uint64_t head = wq->head.load(std::memory_order::acquire);
 		uint64_t next_tail_index = tail + 1;
 		uint64_t mask = wq->capacity - 1;
 

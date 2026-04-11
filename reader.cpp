@@ -10,36 +10,42 @@ int main() {
 
   auto top_of_page = (uint8_t *)active_partition_shen.mapping;
   auto count = 0;
+  auto prev_timestamp = 0;
   while (top_of_page < (uint8_t *)active_partition_shen.mapping + active_partition_shen.mapping_size) {
-    auto header = (DataPageHeader *)top_of_page;
-    auto data = top_of_page + sizeof(DataPageHeader);
-    for (int i = 0; i < header->column_count; ++i) {
-      auto column_id_and_type = header->column_data[i];
-      auto column_offset_from_row = header->column_offsets[i];
-      printf("Column header id: %llu, type: %s, offset: %d\n", column_id_and_type.id.id, COLUMN_TYPE_STRINGS[(uint32_t)column_id_and_type.type], column_offset_from_row);
-    }
+		auto header = (DataPageHeader *)top_of_page;
+		auto data = top_of_page + sizeof(DataPageHeader);
+		for (int i = 0; i < header->column_count; ++i) {
+			auto column_id_and_type = header->column_data[i];
+			auto column_offset_from_row = header->column_offsets[i];
+		}
 
-    auto pointer_in_row = data;
-    assert(pointer_in_row < data + active_partition_shen.mapping_size);
-    auto row_size = *(uint64_t *)pointer_in_row;
-    while (pointer_in_row < top_of_page + header->row_write_offset) {
-      auto row_data_ptr = pointer_in_row + 8;
-      printf("Row data size: %llu", *(uint64_t *)pointer_in_row);
-      for (int i = 0; i < header->column_count; ++i) {
-        auto column_id_and_type = header->column_data[i];
-        auto col_ptr = (uint64_t *)(row_data_ptr + header->column_offsets[i]);
-        printf(", column data at id: %llu, %lli", column_id_and_type.id.id, *(int64_t *)col_ptr);
-      }
-      pointer_in_row += row_size;
-      printf(", timestamp: %llu\n",
-             *(uint64_t *)(pointer_in_row - sizeof(uint64_t))); // go back 1 u64 to get the timestamp
-      row_size = *(uint64_t *)pointer_in_row;
+		auto pointer_in_row = data;
+		assert(pointer_in_row < data + active_partition_shen.mapping_size);
+		auto row_size = *(uint64_t *)pointer_in_row;
+		while (pointer_in_row < top_of_page + header->bytes_written) {
+			auto row_data_ptr = pointer_in_row + 8;
+			for (int i = 0; i < header->column_count; ++i) {
+				auto column_id_and_type = header->column_data[i];
+				auto col_ptr = (uint64_t *)(row_data_ptr + header->column_offsets[i]);
+			}
+
+			pointer_in_row += row_size;
+			auto timestamp = *(uint64_t *)(pointer_in_row - sizeof(uint64_t));
+			row_size = *(uint64_t *)pointer_in_row;
       count++;
-    }
+			if (!prev_timestamp) {
+				prev_timestamp = timestamp;
+			} else {
+				assert(prev_timestamp < timestamp);
+				prev_timestamp = timestamp;
+			}
+		}
 
-  top_of_page += header->next_page;
-}
+		top_of_page += header->next_page;
+	}
 
- printf("\nReader finished processed: %d rows\n", count);
+	printf("last_ts: %d\n", prev_timestamp);
+  assert(prev_timestamp == 9999999);
+  printf("\nReader finished processed: %d rows\n", count);
 }
 

@@ -12,7 +12,7 @@ filetype = "new"
 if len(sys.argv) > 1:
     filetype = str(sys.argv[1])
 
-n_rows = 1000000
+n_rows = 10000000 
 if filetype == "new":
     with open("outfile.data", "w") as file_handler:
         for i in range(n_rows):
@@ -38,7 +38,7 @@ elif filetype == "mixed":
     with open("outfile.data", "w") as file_handler:
         for i in range(n_rows):
             for t in tables:
-                line = f"{t} {n_rows - i} [sensor=\"{random.choice(sensors)}\", site=\"B\", bomb='BBB'] degrees=6969696, columnA=6969696'\n"
+                line = f"{t} {i} [sensor=\"{random.choice(sensors)}\", site=\"B\", bomb='BBB'] degrees=6969696, columnA=6969696, new_str_col='TESTINGSTRING', another='small''\n"
                 file_handler.write(line)
 
 elif filetype == "debug":

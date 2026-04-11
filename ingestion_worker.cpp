@@ -25,39 +25,196 @@ inline bool parse_double(char* str, char* end_ptr, double* out_value) {
 }
 
 #else
-void ingestion_worker_submit_buffered_work_to_writer_and_clear_local_maps(DatabaseContext *db_context, IngestionWorkerContext *t_ctx) {
-      auto active_global_table_id_arr = t_ctx->schema_maps.active_global_table_pages;
-      auto global_pages = t_ctx->schema_maps.table_page_map_array;
-      for (auto i = 0; i < t_ctx->schema_maps.active_global_table_pages_count; ++i) {
-        auto id = active_global_table_id_arr[i];
-        MPSCWriterQueueEntry entry = {};
-        entry.table_id = id;
-        entry.request_info_and_page = global_pages[id.index];
-        entry.thread_id = t_ctx->thread_id;
-        assert(((DataPageHeader *)entry.request_info_and_page.current_page)->next_page == 0);
-        writer_queues_enqueue_entry(&db_context->writer_queues, &entry);
-      }
+void thread_local_schema_maps_init(ThreadLocalSchemaMaps *schema_maps)
+{
+  std::memset(schema_maps, 0, sizeof(ThreadLocalSchemaMaps));
+  auto arena = &schema_maps->arena;
 
-      std::memset(t_ctx->schema_maps.table_page_map_array, 0, TABLE_PAGE_MAP_SIZE);
-      t_ctx->schema_maps.active_global_table_pages_count = 0;
+  arena_init(arena, TABLE_PAGE_MAP_SIZE + TABLE_PAGES_SIZE +
+             LOCAL_TABLE_PAGE_MAP_SIZE + TABLE_REQUEST_INFO_SIZE +
+             ACTIVE_GLOBAL_TABLE_PAGES_SIZE + MEGABYTES(1));
 
-      auto local_pages = t_ctx->schema_maps.local_table_page_map;
-      for (uint32_t i = 0; i < t_ctx->schema_maps.table_id_count; ++i) {
-        MPSCWriterQueueEntry entry = {};
-        auto actual_idx = i + 1;
-        entry.table_id = {.index = actual_idx, .local_flag = 1};
-        entry.request_info_and_page = local_pages.info_and_page_arr[actual_idx];
-        entry.thread_id = t_ctx->thread_id;
+	pool_init(&schema_maps->data_page_pool, arena, DATA_PAGE_LIMIT, DATA_PAGE_SIZE, KILOBYTES(4));
+	pool_init(&schema_maps->per_table_request_info_pool, arena, TABLE_PAGE_LIMIT);
 
-        assert(((DataPageHeader *)entry.request_info_and_page.current_page)->next_page == 0);
-        writer_queues_enqueue_entry(&db_context->writer_queues, &entry);
-      }
+	schema_maps->active_global_table_pages = arena_alloc_struct_array(arena, TableID, TABLE_PAGE_LIMIT);
+	schema_maps->table_page_map_array = arena_alloc_struct_array(arena, RequestInfoAndPage, MAX_TABLES);
+	schema_maps->local_table_page_map.buckets =
+		arena_alloc_struct_array(arena, LocalTablePageMapBucket, DEFAULT_TABLE_CAPACITY);
+	schema_maps->local_table_page_map.strings = arena_alloc_struct_array(arena, SchemaString, DEFAULT_TABLE_CAPACITY);
+  schema_maps->local_table_page_map.info_and_page_arr = arena_alloc_struct_array(arena, RequestInfoAndPage, DEFAULT_TABLE_CAPACITY);
+  schema_maps->local_table_page_map.capacity = DEFAULT_TABLE_CAPACITY;
 
-      t_ctx->prev_timestamp = platform_get_high_res_timer_stamp();
+}
 
-      std::memset(local_pages.buckets, 0, sizeof(LocalTablePageMapBucket) * local_pages.capacity);
-      std::memset(local_pages.info_and_page_arr, 0, sizeof(RequestInfoAndPage) * local_pages.capacity);
-      t_ctx->schema_maps.table_id_count = 0;
+void ingestion_worker_submit_buffered_work_to_writer_and_clear_local_maps(DatabaseContext *db_context,
+																																					IngestionWorkerContext *t_ctx,
+																																					bool clear_buckets = true)
+{
+	auto active_global_table_id_arr = t_ctx->schema_maps.active_global_table_pages;
+	auto global_pages = t_ctx->schema_maps.table_page_map_array;
+	for (auto i = 0; i < t_ctx->schema_maps.active_global_table_pages_count; ++i) {
+		auto id = active_global_table_id_arr[i];
+		MPSCWriterQueueEntry entry = {};
+		entry.table_id = id;
+		entry.request_info_and_page = global_pages[id.index];
+		entry.thread_id = t_ctx->thread_id;
+    entry.start_timestamp = ((DataPageHeader *)global_pages[id.index].page_head)->start_timestamp;
+    entry.end_timestamp = ((DataPageHeader *)global_pages[id.index].current_page)->end_timestamp;
+    auto current_header = (DataPageHeader *)entry.request_info_and_page.current_page;
+    assert(current_header->next_page == 0);
+		writer_queues_enqueue_entry(&db_context->writer_queues, &entry);
+	}
+
+	std::memset(t_ctx->schema_maps.table_page_map_array, 0, TABLE_PAGE_MAP_SIZE);
+	t_ctx->schema_maps.active_global_table_pages_count = 0;
+
+	auto local_pages = t_ctx->schema_maps.local_table_page_map;
+	for (uint32_t i = 0; i < t_ctx->schema_maps.table_id_count; ++i) {
+		MPSCWriterQueueEntry entry = {};
+		auto actual_idx = i + 1;
+		entry.table_id = { .index = actual_idx, .local_flag = 1 };
+		entry.request_info_and_page = local_pages.info_and_page_arr[actual_idx];
+		entry.thread_id = t_ctx->thread_id;
+    entry.start_timestamp = ((DataPageHeader *)local_pages.info_and_page_arr[actual_idx].page_head)->start_timestamp;
+    entry.end_timestamp = ((DataPageHeader *)local_pages.info_and_page_arr[actual_idx].page_head)->end_timestamp;
+
+    auto current_header = (DataPageHeader *)entry.request_info_and_page.current_page;
+    assert(current_header->next_page == 0);
+		writer_queues_enqueue_entry(&db_context->writer_queues, &entry);
+	}
+
+	t_ctx->prev_timestamp = platform_get_high_res_timer_stamp();
+
+	if (clear_buckets) {
+		std::memset(local_pages.buckets, 0, sizeof(LocalTablePageMapBucket) * local_pages.capacity);
+    t_ctx->schema_maps.table_id_count = 0;
+	}
+
+	std::memset(local_pages.info_and_page_arr, 0, sizeof(RequestInfoAndPage) * local_pages.capacity);
+}
+
+uint8_t *schema_maps_get_new_page_and_metadata(DatabaseContext *db_context, IngestionWorkerContext *t_ctx, ThreadLocalSchemaMaps *schema_maps) 
+{
+  auto data = (uint8_t *)pool_atomic_alloc(&schema_maps->data_page_pool, false); // its too big to warrant a full memset 0
+
+  if (!data) {
+    return data;
+  }
+
+	auto data_page_header = (DataPageHeader *)data;
+  data_page_header->is_out_of_order = 0;
+  data_page_header->start_timestamp = 0;
+  data_page_header->end_timestamp = 0;
+  data_page_header->bytes_written = sizeof(DataPageHeader);
+  data_page_header->next_page = 0;
+  return data;
+}
+
+uint8_t *schema_maps_get_new_page_with_flush_and_spin(DatabaseContext *db_context, IngestionWorkerContext *t_ctx, ThreadLocalSchemaMaps *schema_maps) {
+	auto data_page = schema_maps_get_new_page_and_metadata(db_context, t_ctx, schema_maps);
+	if (!data_page) {
+		ingestion_worker_submit_buffered_work_to_writer_and_clear_local_maps(db_context, t_ctx, false);
+		while (!data_page) {
+			data_page = schema_maps_get_new_page_and_metadata(db_context, t_ctx, schema_maps);
+			cpu_pause();
+		}
+	}
+
+  return data_page;
+}
+
+PerTableRequestInfo *schema_maps_get_new_request_info(ThreadLocalSchemaMaps *schema_maps) 
+{
+  auto request_info = (PerTableRequestInfo *)pool_atomic_alloc(&schema_maps->per_table_request_info_pool);
+  request_info->strings_arena.memory = request_info->arena_backing;
+  request_info->strings_arena.capacity = sizeof(request_info->arena_backing);
+  return request_info;
+}
+
+RequestInfoAndPage *local_table_page_map_insert_new_page_and_info(DatabaseContext *db_context, IngestionWorkerContext *t_ctx, ThreadLocalSchemaMaps *schema_maps, StringSlice8 table_name) 
+{
+  auto page_and_metadata = schema_maps_get_new_page_with_flush_and_spin(db_context, t_ctx, schema_maps); 
+	auto new_request_info = schema_maps_get_new_request_info(schema_maps);
+
+	auto &page_map = schema_maps->local_table_page_map;
+	auto hash = std::hash<StringSlice8>{}(table_name);
+	auto index = hash % page_map.capacity;
+	auto &bucket = page_map.buckets[index];
+
+	while (bucket.hash != 0) {
+		if (bucket.hash == hash) {
+			auto &string = page_map.strings[index];
+			if (StringSlice8{string.buffer, string.length} == table_name) {
+				break;
+			}
+		}
+
+		index = (index + 1) % page_map.capacity;
+		bucket = page_map.buckets[index];
+	}
+	auto id = TableID{ .index = ++schema_maps->table_id_count, .local_flag = 1 };
+  bucket.hash = hash;
+	bucket.table_id = id;
+
+	auto &string = page_map.strings[index];
+	string.length = table_name.length;
+	std::memcpy(string.buffer, table_name.content, table_name.length);
+  auto &request_info_and_page = page_map.info_and_page_arr[id.index];
+
+	request_info_and_page.request_info = new_request_info;
+  request_info_and_page.current_page = page_and_metadata;
+  request_info_and_page.page_head = page_and_metadata;
+
+  return &request_info_and_page;
+}
+
+RequestInfoAndPage *local_table_page_map_lookup(ThreadLocalSchemaMaps *schema_maps, StringSlice8 table_name)
+{
+	auto &page_map = schema_maps->local_table_page_map;
+	auto hash = std::hash<StringSlice8>{}(table_name);
+	auto index = hash % page_map.capacity;
+	auto &bucket = page_map.buckets[index];
+
+	auto search_count = 0;
+	while (bucket.hash != 0) {
+		if (bucket.hash == hash) {
+			auto string = page_map.strings[index];
+			if (StringSlice8{string.buffer, string.length} == table_name) {
+        auto id = bucket.table_id;
+				return &page_map.info_and_page_arr[id.index];
+			}
+		}
+
+		if (search_count == page_map.capacity) {
+			return {};
+		}
+
+		index = (index + 1) % page_map.capacity;
+		bucket = page_map.buckets[index];
+	}
+
+	return {};
+}
+
+RequestInfoAndPage *table_page_map_lookup(ThreadLocalSchemaMaps *schema_maps, TableID id)
+{
+	return &schema_maps->table_page_map_array[id.index];
+}
+
+RequestInfoAndPage *table_page_map_insert_new_page_and_info(DatabaseContext *db_context, IngestionWorkerContext *t_ctx,
+																														ThreadLocalSchemaMaps *schema_maps, TableID id)
+{
+	auto &slot = schema_maps->table_page_map_array[id.index];
+
+	auto new_page = schema_maps_get_new_page_with_flush_and_spin(db_context, t_ctx, schema_maps);
+	slot.request_info = schema_maps_get_new_request_info(schema_maps);
+	slot.current_page = new_page;
+	slot.page_head = new_page;
+
+	schema_maps->active_global_table_pages[schema_maps->active_global_table_pages_count++] = id;
+
+	return &slot;
 }
 
 void ingestion_worker_do_work_and_submit_to_writer_periodically(DatabaseContext *db_context, IngestionWorkerContext *t_ctx, MPMCWorkQueue *wq) 
@@ -130,7 +287,7 @@ bool string_sort_cmp(StringSlice8 a, StringSlice8 b)
 ParseValueResult parse_string(StringSlice8 string)
 {
 	ParseValueResult result = {};
-	result.type = ColumnDataType::VARCHAR;
+	result.data.type = ColumnDataType::VARCHAR;
 	result.data.varchar.content = string.content + 1;
 	bool double_quote = string[0] == '"';
 	for (auto i = 1; i < string.length; ++i) {
@@ -157,12 +314,12 @@ ParseValueResult parse_value(StringSlice8 value)
 	bool is_string = value[0] == '"' || value[0] == '\'';
 
 	if (!is_string) {
-		result.type = ColumnDataType::INT64;
+		result.data.type = ColumnDataType::INT64;
 		auto parsing_res = std::from_chars((char *)value.content, (char *)value.content + value.length, result.data.int64);
 
 		if (parsing_res.ec == std::errc::invalid_argument) {
       if (parse_double((char *)value.content, (char *)value.content + value.length, &result.data.dbl)) {
-        result.type = ColumnDataType::INVALID;
+        result.data.type = ColumnDataType::INVALID;
 			} else {
 				result.err_msg = string8_from_cstring("Error parsing column value as int or float");
       }
@@ -198,7 +355,6 @@ ParseColumnResult parse_column(StringSlice8 col)
 	}
 
 	result.data = parsed_val.data;
-	result.type = parsed_val.type;
 	result.name = string_slice_length(col, 0, index_of_equal);
 
 	return result;
@@ -285,12 +441,12 @@ void parse_columns(Arena *a, ParseColumnResultList *results_array, StringSlice8 
 	}
 }
 
-void request_info_assign_offset(PerTableRequestInfo *request_info, ColumnID id, ColumnDataType type)
+void request_info_assign_offset(PerTableRequestInfo *request_info, ColumnID id, ColumnData data)
 {
   auto &offset_slot = request_info->column_offsets[get_offset_idx_from_id(id)];
 	if (!offset_slot) {
 		offset_slot = request_info->running_offset;
-		request_info->running_offset += std::max(8u, get_data_size_from_col_type(type));
+		request_info->running_offset += std::max(8u, get_size_from_col_data(data));
 	}
 }
 
@@ -311,7 +467,7 @@ ColumnID request_info_insert_or_match(PerTableRequestInfo *request_info, ParseCo
 			auto name = (VariableSchemaString *)request_info->string_ptrs[index];
 			if (StringSlice8{ name->buffer, name->length } == result->name) {
 				auto &id_index = request_info->new_column_id_idxs[index];
-				if (request_info->new_column_types[id_index] != result->type) {
+				if (request_info->new_column_types[id_index] != result->data.type) {
 					return {};
 				} else {
           return {.index = id_index, .local_flag = 1};
@@ -325,7 +481,7 @@ ColumnID request_info_insert_or_match(PerTableRequestInfo *request_info, ParseCo
 
   auto id = ColumnID{.index = ++request_info->new_column_id_count, .local_flag = 1};
   request_info->new_column_id_idxs[index] = id.index;
-	request_info->new_column_types[id.index] = result->type;
+	request_info->new_column_types[id.index] = result->data.type;
 
   auto string_ptr = &request_info->string_ptrs[index];
 	*string_ptr = arena_alloc_struct_array(&request_info->strings_arena, VariableSchemaString, result->name.length + 1);
@@ -333,7 +489,7 @@ ColumnID request_info_insert_or_match(PerTableRequestInfo *request_info, ParseCo
 	(*string_ptr)->length = result->name.length;
 	std::memcpy((*string_ptr)->buffer, result->name.content, result->name.length);
 
-  request_info_assign_offset(request_info, id, result->type);
+  request_info_assign_offset(request_info, id, result->data);
   return id;
 }
 
@@ -356,9 +512,9 @@ ColumnID request_info_insert(PerTableRequestInfo *request_info, ParseColumnResul
 	(*string_ptr)->length = result->name.length;
 	std::memcpy((*string_ptr)->buffer, result->name.content, result->name.length);
 
-	request_info->new_column_types[id.index] = result->type;
+	request_info->new_column_types[id.index] = result->data.type;
 
-  request_info_assign_offset(request_info, id, result->type);
+  request_info_assign_offset(request_info, id, result->data);
   return id;
 }
 
@@ -405,26 +561,20 @@ void insert_col_info_to_row_cache_at_index(PrevRowColumnCache *cache, TableID ta
 	cache_entry.prev_string = parsed_column.name;
 }
 
-void write_parsed_data(ThreadLocalSchemaMaps *schema_maps, uint64_t timestamp, RequestInfoAndPage *request_info_and_page, PrevRowColumnCache cache,
+void write_parsed_data(DatabaseContext *db_context, IngestionWorkerContext *t_ctx, ThreadLocalSchemaMaps *schema_maps,
+											 uint64_t timestamp, RequestInfoAndPage *request_info_and_page, PrevRowColumnCache cache,
 											 ParseColumnResultList parsed_columns)
 {
-  // calculate row size
+	// calculate row size
 
   uint64_t maximum_offset = 0; // theoretically can have a uint16_t but need the 64 for alignment
   uint64_t max_offset_data_size = 0;
   auto request_info = request_info_and_page->request_info;
-  auto string_data = 0;
   for (int i = 0; i < parsed_columns.n_results; ++i) {
     auto &parsed_column = parsed_columns.results[i];
     auto &cache_entry = cache.entries[i];
-    auto data_size = std::max(8u, get_data_size_from_col_type(parsed_column.type));
-
-    if (parsed_column.type == ColumnDataType::VARCHAR) {
-      string_data += parsed_column.data.varchar.length + 8; // bytes to write plus the length
-    }
-
+    auto data_size = std::max(8u, get_size_from_col_data(parsed_column.data));
     auto offset = request_info->column_offsets[get_offset_idx_from_id(cache_entry.column_id)] + sizeof(uint64_t);
-
 		if (maximum_offset < offset) {
 			maximum_offset = offset;
       max_offset_data_size = data_size;
@@ -433,18 +583,47 @@ void write_parsed_data(ThreadLocalSchemaMaps *schema_maps, uint64_t timestamp, R
   
   maximum_offset = maximum_offset + max_offset_data_size;
   max_offset_data_size = 8;
-  auto bytes_to_write = maximum_offset + max_offset_data_size + string_data;
 
-  auto current_page_ptr = &request_info_and_page->current_page;
-  auto current_header = (DataPageHeader *)(*current_page_ptr);
+  auto bytes_to_write = maximum_offset + max_offset_data_size;
+  auto current_page = request_info_and_page->current_page;
+  auto current_header = (DataPageHeader *)current_page;
 	if (current_header->bytes_written + bytes_to_write >= DATA_PAGE_SIZE) {
-		*current_page_ptr = schema_maps_get_new_page_and_metadata(schema_maps);
-		current_header->next_page = reinterpret_cast<uint64_t>(*current_page_ptr);
-    current_header = (DataPageHeader *)request_info_and_page->current_page;
-    current_header->next_page = 0; // zero this out since the header is not zeroed by default
+		auto data_page = schema_maps_get_new_page_and_metadata(db_context, t_ctx, schema_maps);
+    if (!data_page) {
+      auto new_request_info = schema_maps_get_new_request_info(schema_maps);
+      new_request_info->table_schema_version = request_info->table_schema_version;
+      new_request_info->table_name.length = request_info->table_name.length;
+
+      std::memcpy(new_request_info->table_name.buffer, request_info->table_name.buffer, sizeof(request_info->table_name));
+      std::memcpy(new_request_info->arena_backing, request_info->arena_backing, sizeof(request_info->arena_backing));
+      std::memcpy(new_request_info->new_column_hashes, request_info->new_column_hashes, sizeof(request_info->new_column_hashes));
+      std::memcpy(new_request_info->string_ptrs, request_info->string_ptrs, sizeof(request_info->string_ptrs));
+      std::memcpy(new_request_info->new_column_id_idxs, request_info->new_column_id_idxs, sizeof(uint32_t) * request_info->new_column_id_count);
+      std::memcpy(new_request_info->new_column_types, request_info->new_column_types, sizeof(uint32_t) * request_info->new_column_id_count);
+      std::memcpy(new_request_info->global_column_ids, request_info->global_column_ids, sizeof(ColumnID) * request_info->new_column_id_count);
+      std::memcpy(new_request_info->column_offsets, request_info->column_offsets, sizeof(request_info->column_offsets));
+      new_request_info->running_offset = request_info->running_offset;
+      new_request_info->row_count = request_info->row_count;
+
+      ingestion_worker_submit_buffered_work_to_writer_and_clear_local_maps(db_context, t_ctx, false);
+
+      while (!data_page) {
+        data_page = schema_maps_get_new_page_and_metadata(db_context, t_ctx, schema_maps);
+        cpu_pause();
+      }
+
+      request_info_and_page->request_info = new_request_info;
+      request_info_and_page->page_head = data_page;
+      request_info_and_page->current_page = data_page;
+      request_info = request_info_and_page->request_info;
+    } else { 
+      current_header->next_page = reinterpret_cast<uint64_t>(data_page);
+      request_info_and_page->current_page = data_page;
+    }
 	}
 
-	auto current_page = request_info_and_page->current_page;
+  current_page = request_info_and_page->current_page;
+  current_header = (DataPageHeader *)current_page;
 
   if (!current_header->start_timestamp) {
     current_header->start_timestamp = timestamp;
@@ -456,19 +635,22 @@ void write_parsed_data(ThreadLocalSchemaMaps *schema_maps, uint64_t timestamp, R
     current_header->end_timestamp = timestamp;  // always set the end timstamp to the latest even for out of order data
   }
 
+  auto write_ptr = current_page + current_header->bytes_written;
+  assert(current_header->bytes_written >= sizeof(DataPageHeader));
+  assert((uintptr_t)write_ptr % 8 == 0);
+  auto row_size_ptr = (uint64_t *)write_ptr;
+  *row_size_ptr = maximum_offset + max_offset_data_size;
 
-  auto write_ptr = (uint8_t *)(current_page) + current_header->row_write_offset;
-  assert((uint64_t)write_ptr % 8 == 0);
-  *((uint64_t *)(write_ptr)) = maximum_offset + max_offset_data_size;
 	for (int i = 0; i < parsed_columns.n_results; ++i) {
     auto &parsed_column = parsed_columns.results[i];
     auto &cache_entry = cache.entries[i];
 
-		auto data_size = std::max(8u, get_data_size_from_col_type(parsed_column.type));
+		auto data_size = std::max(8u, get_size_from_col_data(parsed_column.data));
 		auto offset = request_info->column_offsets[get_offset_idx_from_id(cache_entry.column_id)] + sizeof(uint64_t); // add the size of the row length
 		auto col_ptr = write_ptr + offset;
+    assert((uintptr_t)col_ptr % 8 == 0);
 
-    switch (parsed_column.type)
+    switch (parsed_column.data.type)
 		{
 		case ColumnDataType::TIMESTAMP:
 			std::memcpy(col_ptr, &parsed_column.data.int64, data_size);
@@ -486,14 +668,11 @@ void write_parsed_data(ThreadLocalSchemaMaps *schema_maps, uint64_t timestamp, R
 			std::memcpy(col_ptr, &parsed_column.data.int64, data_size);
 			break;
 		case ColumnDataType::VARCHAR: {
-      auto string_start_offset = (DATA_PAGE_SIZE - current_header->string_data_end) - (parsed_column.data.varchar.length + 8);
-			std::memcpy(col_ptr, &string_start_offset, data_size);
-      auto string_start_ptr = (current_page->data + string_start_offset);
-      *((int64_t *)(string_start_ptr)) = parsed_column.data.varchar.length;
-      string_start_ptr += 8;
-      std::memcpy(string_start_ptr, parsed_column.data.varchar.content, parsed_column.data.varchar.length);
-      current_header->string_data_end += (parsed_column.data.varchar.length + 8);
-    } break;
+			*(int64_t *)col_ptr = parsed_column.data.varchar.length; // this address will be 8 byte aligned so cast is legal
+			std::memcpy(col_ptr + 8, parsed_column.data.varchar.content, parsed_column.data.varchar.length);
+      std::memset(col_ptr + 8 + parsed_column.data.varchar.length, 0, data_size - parsed_column.data.varchar.length - 8);
+
+		} break;
 		default:
 			break;
 		}
@@ -503,7 +682,6 @@ void write_parsed_data(ThreadLocalSchemaMaps *schema_maps, uint64_t timestamp, R
   *timestamp_ptr = timestamp;
 
   current_header->bytes_written += bytes_to_write;
-  current_header->row_write_offset += maximum_offset + max_offset_data_size;
   request_info->row_count++;
   assert(current_header->bytes_written <= DATA_PAGE_SIZE);
 }
@@ -512,7 +690,7 @@ void *process_write_request(IngestionWorkerContext *t_ctx, DatabaseContext *cont
 {
 
 	auto time_start = platform_get_high_res_timer_stamp();
-	auto schema_maps_result = get_latest_schema_maps_inc_refcount(&context->schema_maps_tripple_buffer);
+	auto schema_maps_result = schema_maps_get_latest_version_inc_refcount(&context->schema_maps_tripple_buffer);
 	auto global_schema_maps = schema_maps_result.maps;
 	auto local_schema_maps = &t_ctx->schema_maps;
 
@@ -528,6 +706,11 @@ void *process_write_request(IngestionWorkerContext *t_ctx, DatabaseContext *cont
 																							&t_ctx->transient_arena, PrevRowColumnCacheEntry, DATA_PAGE_HEADER_SIZE),
 																						.n_entries = DATA_PAGE_HEADER_SIZE };
 
+  if (data_to_write.length >= DATA_PAGE_SIZE * TABLE_PAGE_LIMIT) {
+    fprintf(stderr, "Rejected: Batch size too large\n");
+    goto cleanup;
+  }
+
 	for (; tokeniser.at - (char *)data_to_write.content < data_to_write.length; ++tokeniser.at) {
 		row_count++;
 		if (*tokeniser.at == '\n') {
@@ -535,6 +718,7 @@ void *process_write_request(IngestionWorkerContext *t_ctx, DatabaseContext *cont
 		}
 
     bool is_full_line_to_parse = false;
+    int i = (ptrdiff_t)(tokeniser.at - (char *)data_to_write.content);
     for (int i = (ptrdiff_t)(tokeniser.at - (char *)data_to_write.content); i < data_to_write.length; ++i) {
       if (data_to_write.content[i] == '\n') {
         is_full_line_to_parse = true;
@@ -543,7 +727,8 @@ void *process_write_request(IngestionWorkerContext *t_ctx, DatabaseContext *cont
     }
 
     if (!is_full_line_to_parse) {
-      goto cleanup;
+      tokeniser.at += i;
+      continue;
     }
 
 		//TODO(Ray) write an actual parser using SIMD - this is painful
@@ -572,7 +757,7 @@ void *process_write_request(IngestionWorkerContext *t_ctx, DatabaseContext *cont
 			auto page_map_result = local_table_page_map_lookup(local_schema_maps, table_name);
 
 			if (!page_map_result) {
-				page_map_result = local_table_page_map_insert_new_page_and_info(local_schema_maps, table_name);
+				page_map_result = local_table_page_map_insert_new_page_and_info(context, t_ctx, local_schema_maps, table_name);
         auto request_info = page_map_result->request_info;
 
         request_info->table_name.length = table_name.length;
@@ -581,16 +766,15 @@ void *process_write_request(IngestionWorkerContext *t_ctx, DatabaseContext *cont
 				for (int i = 0; i < parsed_columns_array.n_results; ++i) {
 					auto &parsed_column = parsed_columns_array.results[i];
 					auto column_id = request_info_insert(request_info, &parsed_column);
-					request_info->new_column_types[column_id.index] = parsed_column.type;
+					request_info->new_column_types[column_id.index] = parsed_column.data.type;
 					insert_col_info_to_row_cache_at_index(&prev_row_col_cache, table_id, column_id, parsed_column, i);
 				}
 
-				write_parsed_data(local_schema_maps, timestamp, page_map_result, prev_row_col_cache, parsed_columns_array);
+				write_parsed_data(context, t_ctx, local_schema_maps, timestamp, page_map_result, prev_row_col_cache, parsed_columns_array);
 
 			} else {
         if (!page_map_result->page_head) {
-          // if no page, clear the info and get a new page for now
-          page_map_result->page_head = schema_maps_get_new_page_and_metadata(local_schema_maps);
+          page_map_result->page_head = schema_maps_get_new_page_with_flush_and_spin(context, t_ctx, local_schema_maps);
           page_map_result->request_info = schema_maps_get_new_request_info(local_schema_maps);
         }
 
@@ -601,22 +785,21 @@ void *process_write_request(IngestionWorkerContext *t_ctx, DatabaseContext *cont
 					if (cache_entry.table_id == table_id && cache_entry.prev_string != parsed_column.name) {
 						auto column_id = request_info_insert_or_match(page_map_result->request_info, &parsed_columns_array.results[i]);
 						insert_col_info_to_row_cache_at_index(&prev_row_col_cache, table_id, column_id, parsed_column, i);
-					} else if (cached_type != parsed_column.type) {
-						output_column_error_message("Error in the local cache", table_name, parsed_column.type, cached_type);
+					} else if (cached_type != parsed_column.data.type) {
+						output_column_error_message("Error in the local cache", table_name, parsed_column.data.type, cached_type);
             goto cleanup;
 					}
 
-					write_parsed_data(local_schema_maps, timestamp, page_map_result, prev_row_col_cache, parsed_columns_array);
 				}
+        write_parsed_data(context, t_ctx, local_schema_maps, timestamp, page_map_result, prev_row_col_cache, parsed_columns_array);
 			}
 		} else {
 			// table exists can just use the schema_maps for lookups
 			auto page_and_info = table_page_map_lookup(local_schema_maps, table_id);
       auto request_info = page_and_info->request_info;
 
-
-			if (!page_and_info->page_head) {
-				page_and_info = table_page_map_insert_new_page_and_info(local_schema_maps, table_id);
+			if (!page_and_info->request_info) {
+				page_and_info = table_page_map_insert_new_page_and_info(context, t_ctx, local_schema_maps, table_id);
         request_info = page_and_info->request_info;
 				request_info->table_schema_version = schema_maps_lookup_table_schema_by_id(global_schema_maps, table_id)->version;
 
@@ -630,18 +813,18 @@ void *process_write_request(IngestionWorkerContext *t_ctx, DatabaseContext *cont
 					if (!column_id.id) {
 						column_id = request_info_insert(request_info, &parsed_column);
 					} else {
-						if ( expected_type != parsed_column.type) {
-							output_column_error_message("Error in global table info", table_name, parsed_column.type, expected_type);
+						if ( expected_type != parsed_column.data.type) {
+							output_column_error_message("Error in global table info", table_name, parsed_column.data.type, expected_type);
               goto cleanup;
 						};
             request_info->global_column_ids[column_id.index] = column_id;
 					}
 
-          request_info_assign_offset(request_info, column_id, parsed_column.type);
+          request_info_assign_offset(request_info, column_id, parsed_column.data);
           insert_col_info_to_row_cache_at_index(&prev_row_col_cache, table_id, column_id, parsed_column, i);
 				}
 
-				write_parsed_data(local_schema_maps, timestamp, page_and_info, prev_row_col_cache, parsed_columns_array);
+				write_parsed_data(context, t_ctx, local_schema_maps, timestamp, page_and_info, prev_row_col_cache, parsed_columns_array);
 
 			} else {
 				request_info->table_schema_version = schema_maps_lookup_table_schema_by_id(global_schema_maps, table_id)->version;
@@ -663,8 +846,8 @@ void *process_write_request(IngestionWorkerContext *t_ctx, DatabaseContext *cont
               }
 
 						} else {
-              if (expected_type != parsed_column.type) {
-                output_column_error_message("Erorr in request info", table_name, parsed_column.type, expected_type);
+              if (expected_type != parsed_column.data.type) {
+                output_column_error_message("Erorr in request info", table_name, parsed_column.data.type, expected_type);
                 goto cleanup;
               }
             }
@@ -673,7 +856,7 @@ void *process_write_request(IngestionWorkerContext *t_ctx, DatabaseContext *cont
             // if column isn't yet in request info 
             if (request_info->global_column_ids[column_id.index].id == 0) {
               request_info->global_column_ids[column_id.index] = column_id;
-              request_info_assign_offset(request_info, column_id, parsed_column.type);
+              request_info_assign_offset(request_info, column_id, parsed_column.data);
             }
 
 					} else {
@@ -681,23 +864,21 @@ void *process_write_request(IngestionWorkerContext *t_ctx, DatabaseContext *cont
             bool is_cached = false;
             if (cache_entry.column_id.local_flag) {
               data_type = request_info->new_column_types[cache_entry.column_id.index];
-              if (data_type != parsed_column.type) {
-                output_column_error_message("Error in cache table", table_name, parsed_column.type, data_type);
+              if (data_type != parsed_column.data.type) {
+                output_column_error_message("Error in cache table", table_name, parsed_column.data.type, data_type);
                 goto cleanup;
               }
             } else {
               data_type = schema_maps_get_column_data_type(global_schema_maps, table_id, cache_entry.column_id);
-              if (data_type != parsed_column.type) {
-                output_column_error_message("Error in global table", table_name, parsed_column.type, data_type);
+              if (data_type != parsed_column.data.type) {
+                output_column_error_message("Error in global table", table_name, parsed_column.data.type, data_type);
                 goto cleanup;
               }
 
             }
           }
 				}
-
-				write_parsed_data(local_schema_maps, timestamp, page_and_info, prev_row_col_cache, parsed_columns_array);
-
+				write_parsed_data(context, t_ctx, local_schema_maps, timestamp, page_and_info, prev_row_col_cache, parsed_columns_array);
 			}
 		}
 

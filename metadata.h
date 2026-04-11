@@ -5,13 +5,14 @@
 */ 
 #pragma once
 
-#define MAX_TABLES (16384)
-#define DEFAULT_TABLE_CAPACITY (512u)
-#define TABLE_PAGE_LIMIT (8192)
-#define PER_REQUEST_INFO_LIMIT (256)
-#define LOCAL_TABLE_PAGE_MAP_LIMIT (512)
-#define MAX_COLUMNS (1024)
-#define DATA_PAGE_SIZE (KILOBYTES(64))
+static constexpr auto MAX_TABLES = 16384;
+static constexpr auto DEFAULT_TABLE_CAPACITY = 512u;
+static constexpr auto TABLE_PAGE_LIMIT = 8192;
+static constexpr auto DATA_PAGE_LIMIT = 16384;
+static constexpr auto PER_REQUEST_INFO_LIMIT = 256;
+static constexpr auto LOCAL_TABLE_PAGE_MAP_LIMIT = 512;
+static constexpr auto MAX_COLUMNS = 1024;
+static constexpr auto DATA_PAGE_SIZE = 65536;
 #include <stdint.h>
 
 #include "utils.h"
@@ -332,88 +333,6 @@ struct ColumnIDAndType {
 	ColumnDataType type;
 };
 
-
-struct PerTableRequestInfo {
-  // Hash table info
-  Arena strings_arena; // make sure memory is 16 byte aligned for simd
-	uint64_t table_schema_version;
-  uint64_t global_schema_version;
-  SchemaString table_name;
-  SchemaString arena_backing[MAX_COLUMNS];
-	uint64_t new_column_hashes[MAX_COLUMNS];
-  VariableSchemaString *string_ptrs[MAX_COLUMNS];
-  uint32_t new_column_id_idxs[MAX_COLUMNS];
-	ColumnDataType new_column_types[MAX_COLUMNS];
-  uint32_t new_column_id_count; 
-  
-  //Global Column info
-  ColumnID global_column_ids[MAX_COLUMNS];
-
-  uint32_t column_offsets[MAX_COLUMNS];
-  uint32_t running_offset;
-  int64_t row_count;
-};
-
-struct DataPage {
-  char data[DATA_PAGE_SIZE];
-};
-
-struct DataPageHeader {
-
-  bool is_out_of_order; 
-  uint64_t start_timestamp;
-  uint64_t end_timestamp;
-  uint32_t row_write_offset;
-  uint32_t bytes_written;
-  uint32_t string_data_end; // string data is stored bottom up
-  uint64_t next_page;
-
-	int64_t column_count;
-	ColumnIDAndType column_data[DATA_PAGE_HEADER_SIZE];
-  uint32_t column_offsets[DATA_PAGE_HEADER_SIZE];
-};
-
-
-struct RequestInfoAndPage {
-  PerTableRequestInfo *request_info;
-  DataPage *page_head;
-  DataPage *current_page;
-};
-
-struct LocalTablePageMapBucket {
-  uint64_t hash;
-	TableID table_id;
-};
-
-struct LocalTablePageMap {
-  SchemaString *strings;
-  LocalTablePageMapBucket *buckets;
-	RequestInfoAndPage *info_and_page_arr;
-  uint32_t capacity;
-};
-
-struct PrevRowColumnCacheEntry {
-  TableID table_id;
-  ColumnID column_id;
-  StringSlice8 prev_string;
-};
-
-struct PrevRowColumnCache {
-  PrevRowColumnCacheEntry *entries;
-  uint32_t n_entries;
-};
-
-struct ThreadLocalSchemaMaps {
-	Arena arena;
-  TableID *active_global_table_pages; // NOTE(Ray) This is only for actual tables 
-	PoolAllocatorSPSCFreeList<DataPage> data_page_pool;
-  PoolAllocatorSPSCFreeList<PerTableRequestInfo> per_table_request_info_pool;
-	RequestInfoAndPage *table_page_map_array;
-	LocalTablePageMap local_table_page_map;
-	uint32_t table_id_count;
-  uint32_t active_global_table_pages_count;
-};
-
 // NOTE(Ray): Column maps are pretty small the chances are that we get the empty slot first time is high
 // Storing the string inline means we dont cache miss comparing the string data. 
 struct ColumnHashTableBucket {
@@ -467,13 +386,6 @@ struct SchemaMapsResult {
 	uint64_t version_number;
 };
 
-
-static constexpr auto TABLE_PAGE_MAP_SIZE = MAX_TABLES * sizeof(RequestInfoAndPage);
-static constexpr auto TABLE_PAGES_SIZE = (DATA_PAGE_SIZE + sizeof(DataPage)) * TABLE_PAGE_LIMIT;
-static constexpr auto LOCAL_TABLE_PAGE_MAP_SIZE = DEFAULT_TABLE_CAPACITY * (sizeof(LocalTablePageMapBucket) + sizeof(SchemaString) + sizeof(RequestInfoAndPage));
-static constexpr auto TABLE_REQUEST_INFO_SIZE = TABLE_PAGE_LIMIT * sizeof(PerTableRequestInfo);
-static constexpr auto ACTIVE_GLOBAL_TABLE_PAGES_SIZE = TABLE_PAGE_LIMIT * sizeof(TableID);
-
 inline int calculate_schema_padding_on_name_length(int64_t name_length);
 void put_column_info_on_disk_schema_column(ColumnInfo *info, MemoryMappedFile *schema_file);
 TableNameSlot *_get_table_name_slot_ptr(SchemaMaps *schema_maps, uint32_t index);
@@ -493,16 +405,9 @@ TableID schema_maps_create_table(SchemaMaps *schema_maps, StringSlice8 table_nam
 TableSchema *schema_maps_lookup_table_schema_by_id(SchemaMaps *schema_maps, TableID id); 
 void schema_maps_delete_table(SchemaMaps *schema_maps, TableID id); 
 SchemaMaps *get_latest_schema_maps(SchemaCacheTrippleBuffer *maps); 
-SchemaMapsResult get_latest_schema_maps_inc_refcount(SchemaCacheTrippleBuffer *maps);
+SchemaMapsResult schema_maps_get_latest_version_inc_refcount(SchemaCacheTrippleBuffer *maps);
 void schema_maps_dec_refcount(SchemaCacheTrippleBuffer *maps, SchemaMapsResult maps_result);
-void thread_local_schema_maps_init(ThreadLocalSchemaMaps *schema_maps);
-DataPage *schema_maps_get_new_page_and_metadata(ThreadLocalSchemaMaps *schema_maps); 
-PerTableRequestInfo *schema_maps_get_new_request_info(ThreadLocalSchemaMaps *schema_maps); 
-RequestInfoAndPage *local_table_page_map_insert_new_page_and_info(ThreadLocalSchemaMaps *schema_maps, StringSlice8 table_name); 
-RequestInfoAndPage *local_table_page_map_lookup(ThreadLocalSchemaMaps *schema_maps, StringSlice8 table_name);
-RequestInfoAndPage *table_page_map_lookup(ThreadLocalSchemaMaps *schema_maps, TableID id); 
-RequestInfoAndPage *table_page_map_insert_new_page_and_info(ThreadLocalSchemaMaps *schema_maps, TableID id);
-uint32_t get_data_size_from_col_type(ColumnDataType type); 
+uint32_t get_size_from_col_data(ColumnData data); 
 SchemaMaps *_get_map_at_version(SchemaCacheTrippleBuffer *maps, uint64_t version);
 uint32_t get_offset_idx_from_id(ColumnID id);
 bool schema_maps_check_table_id_exists(SchemaMaps *schema_maps, TableID table_id);

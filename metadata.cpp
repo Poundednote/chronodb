@@ -354,7 +354,7 @@ SchemaMaps *_get_map_at_version(SchemaCacheTrippleBuffer *maps, uint64_t version
   return &maps->maps[version % 3];
 }
 
-SchemaMapsResult get_latest_schema_maps_inc_refcount(SchemaCacheTrippleBuffer *maps)
+SchemaMapsResult schema_maps_get_latest_version_inc_refcount(SchemaCacheTrippleBuffer *maps)
 {
 	auto version_number = maps->version_number.load(std::memory_order_acquire);
 	auto index = version_number % 3;
@@ -368,151 +368,19 @@ void schema_maps_dec_refcount(SchemaCacheTrippleBuffer *maps, SchemaMapsResult m
 	maps->refcounts[index].fetch_sub(1, std::memory_order_acquire);
 }
 
-void thread_local_schema_maps_init(ThreadLocalSchemaMaps *schema_maps)
+uint32_t get_size_from_col_data(ColumnData data)
 {
-  std::memset(schema_maps, 0, sizeof(ThreadLocalSchemaMaps));
-  auto arena = &schema_maps->arena;
-
-	arena_init(arena, TABLE_PAGE_MAP_SIZE + LOCAL_TABLE_PAGE_MAP_SIZE + TABLE_PAGES_SIZE + TABLE_REQUEST_INFO_SIZE +
-											ACTIVE_GLOBAL_TABLE_PAGES_SIZE);
-
-	pool_init(&schema_maps->data_page_pool, arena, TABLE_PAGE_LIMIT, KILOBYTES(4));
-	pool_init(&schema_maps->per_table_request_info_pool, arena, TABLE_PAGE_LIMIT);
-
-	schema_maps->active_global_table_pages = arena_alloc_struct_array(arena, TableID, TABLE_PAGE_LIMIT);
-	schema_maps->table_page_map_array = arena_alloc_struct_array(arena, RequestInfoAndPage, MAX_TABLES);
-	schema_maps->local_table_page_map.buckets =
-		arena_alloc_struct_array(arena, LocalTablePageMapBucket, DEFAULT_TABLE_CAPACITY);
-	schema_maps->local_table_page_map.strings = arena_alloc_struct_array(arena, SchemaString, DEFAULT_TABLE_CAPACITY);
-  schema_maps->local_table_page_map.info_and_page_arr = arena_alloc_struct_array(arena, RequestInfoAndPage, DEFAULT_TABLE_CAPACITY);
-  schema_maps->local_table_page_map.capacity = DEFAULT_TABLE_CAPACITY;
-
-}
-
-DataPage *schema_maps_get_new_page_and_metadata(ThreadLocalSchemaMaps *schema_maps) 
-{
-  auto data_page = pool_atomic_alloc(&schema_maps->data_page_pool, false); // its too big to warrant a full memset 0
-  auto data_page_header = (DataPageHeader *)data_page;
-  while (data_page == 0) {
-    yield_processor();
-    data_page = pool_atomic_alloc(&schema_maps->data_page_pool, false);
-  }
-  data_page_header->bytes_written = sizeof(DataPageHeader);
-  data_page_header->start_timestamp = 0;
-  data_page_header->end_timestamp = 0;
-  data_page_header->string_data_end = 0;
-  data_page_header->row_write_offset = sizeof(DataPageHeader);
-  return data_page;
-}
-
-PerTableRequestInfo *schema_maps_get_new_request_info(ThreadLocalSchemaMaps *schema_maps) 
-{
-  auto request_info = (PerTableRequestInfo *)pool_atomic_alloc(&schema_maps->per_table_request_info_pool);
-  request_info->strings_arena.memory = request_info->arena_backing;
-  request_info->strings_arena.capacity = sizeof(request_info->arena_backing);
-
-  return request_info;
-}
-
-RequestInfoAndPage *local_table_page_map_insert_new_page_and_info(ThreadLocalSchemaMaps *schema_maps, StringSlice8 table_name) 
-{
-  auto page_and_metadata = schema_maps_get_new_page_and_metadata(schema_maps);
-	auto new_request_info = schema_maps_get_new_request_info(schema_maps);
-
-	auto &page_map = schema_maps->local_table_page_map;
-	auto hash = std::hash<StringSlice8>{}(table_name);
-	auto index = hash % page_map.capacity;
-	auto &bucket = page_map.buckets[index];
-
-	while (bucket.hash != 0) {
-		if (bucket.hash == hash) {
-			auto &string = page_map.strings[index];
-			if (StringSlice8{string.buffer, string.length} == table_name) {
-				break;
-			}
-		}
-
-		index = (index + 1) % page_map.capacity;
-		bucket = page_map.buckets[index];
-	}
-	auto id = TableID{ .index = ++schema_maps->table_id_count, .local_flag = 1 };
-  bucket.hash = hash;
-	bucket.table_id = id;
-
-	auto &string = page_map.strings[index];
-	string.length = table_name.length;
-	std::memcpy(string.buffer, table_name.content, table_name.length);
-  auto &request_info_and_page = page_map.info_and_page_arr[id.index];
-
-	request_info_and_page.request_info = new_request_info;
-  request_info_and_page.current_page = page_and_metadata;
-  request_info_and_page.page_head = page_and_metadata;
-
-  return &request_info_and_page;
-}
-
-RequestInfoAndPage *local_table_page_map_lookup(ThreadLocalSchemaMaps *schema_maps, StringSlice8 table_name)
-{
-	auto &page_map = schema_maps->local_table_page_map;
-	auto hash = std::hash<StringSlice8>{}(table_name);
-	auto index = hash % page_map.capacity;
-	auto &bucket = page_map.buckets[index];
-
-	auto search_count = 0;
-	while (bucket.hash != 0) {
-		if (bucket.hash == hash) {
-			auto string = page_map.strings[index];
-			if (StringSlice8{string.buffer, string.length} == table_name) {
-        auto id = bucket.table_id;
-				return &page_map.info_and_page_arr[id.index];
-			}
-		}
-
-		if (search_count == page_map.capacity) {
-			return {};
-		}
-
-		index = (index + 1) % page_map.capacity;
-		bucket = page_map.buckets[index];
-	}
-
-	return {};
-}
-
-RequestInfoAndPage *table_page_map_lookup(ThreadLocalSchemaMaps *schema_maps, TableID id) 
-{
-  return &schema_maps->table_page_map_array[id.index];
-}
-
-RequestInfoAndPage *table_page_map_insert_new_page_and_info(ThreadLocalSchemaMaps *schema_maps, TableID id)
-{
-
-
-  auto &slot = schema_maps->table_page_map_array[id.index];
-
-  auto new_page = schema_maps_get_new_page_and_metadata(schema_maps);
-	slot.request_info = schema_maps_get_new_request_info(schema_maps);
-  slot.current_page = new_page;
-  slot.page_head = new_page;
-
-  schema_maps->active_global_table_pages[schema_maps->active_global_table_pages_count++] = id;
-
-  return &slot;
-}
-
-uint32_t get_data_size_from_col_type(ColumnDataType type)
-{
-	switch (type) {
+	switch (data.type) {
 	case ColumnDataType::DOUBLE:
 	case ColumnDataType::INT64:
 		return 8;
 
 	case ColumnDataType::FLOAT:
 	case ColumnDataType::INT32:
-		return 8;
+		return 4;
 
 	case ColumnDataType::VARCHAR:
-		return 4;
+		return align_size_forward_pow2(data.varchar.length + 8, 8);
 	default:
 		return 0;
 	}

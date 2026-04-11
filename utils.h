@@ -27,6 +27,11 @@
 
 #include <algorithm> 
 
+size_t align_size_forward_pow2(size_t size, size_t alignment) 
+{
+  assert(((alignment - 1) & alignment) == 0);
+  return (size + (alignment - 1)) & ~(alignment - 1);
+}
 template <typename T>
 struct DynamicArray {
     T* data;
@@ -118,6 +123,98 @@ void *arena_alloc_zero(Arena *a, uint64_t size, uint64_t alignment)
 
 #define arena_atomic_alloc_struct(a, struct) (struct *)arena_atomic_alloc(a, sizeof(struct), alignof(struct))
 #define arena_atomic_alloc_struct_array(a, struct, n) (struct *)arena_atomic_alloc(a, sizeof(struct) * n)
+/* NOTE(Ray):
+ * This pool allocator uses an SPSC free list array to track free entries instead of the more traditional linked list approach
+ * The array is initiliezed with pointers to the blocks and they are popped from the head. Its a queue so free entries just get added to the end
+ * in whatever order they get deallocated. This is used in the ingestion worker and writer thread to reduce MESI contention
+ * on the single head of the traditional pool allocators. Instead we have bassically 0 contention 
+ * because head and tail are on seperate lines we use a shadow tail to make sure we only check the queue is empty every once 
+ * in a while
+ *
+ *
+ *
+*/
+struct PoolAllocatorSPSCFreeListSize {
+  alignas(std::hardware_destructive_interference_size) std::atomic<uint64_t> head;
+  alignas(std::hardware_destructive_interference_size) std::atomic<uint64_t> shadow_tail;
+  alignas(std::hardware_destructive_interference_size) std::atomic<uint64_t> tail;
+  void **free_list_entries;
+  int64_t block_count;
+  int64_t block_size;
+  void *memory;
+};
+
+void pool_init(PoolAllocatorSPSCFreeListSize *p, size_t block_count, size_t block_size, void *memory, size_t memory_size) 
+{
+
+	assert((block_size * block_count) + (sizeof(void *) * block_count) <= memory_size);
+  assert(((block_count - 1) & block_count) == 0); // make sure pow 2 size
+  p->block_count = block_count;
+  p->block_size = block_size;
+  p->memory = memory;
+  p->free_list_entries = (void **)((uint8_t *)p->memory + (block_size * block_count));
+	for (auto i = 0; i < block_count; ++i) {
+    void *memory_block = (void *)((uint8_t *)p->memory + (block_size * i));
+    p->free_list_entries[i] = memory_block;
+	}
+
+  p->shadow_tail = block_count;
+  p->tail.store(block_count, std::memory_order::release);
+
+}
+
+void pool_init(PoolAllocatorSPSCFreeListSize *p, size_t block_count, size_t block_size, size_t alignment = 8) 
+{
+	size_t memory_size = block_size * block_count + sizeof(void *) * block_count;
+	void *memory = page_allocator_alloc(memory_size);
+
+	pool_init(p, block_count, block_size, memory, memory_size);
+}
+
+void pool_init(PoolAllocatorSPSCFreeListSize *p, Arena *a, size_t block_count, size_t block_size, size_t alignment = 8) 
+{
+  size_t memory_size = (block_size * block_count) + (sizeof(void *) * block_count);
+	auto memory = arena_alloc(a, memory_size, alignment);
+  pool_init(p, block_count, block_size, memory, memory_size);
+}
+
+
+void *pool_atomic_alloc(PoolAllocatorSPSCFreeListSize *p, bool zeroed = true)
+{
+  auto head = p->head.load(std::memory_order::relaxed);
+  if (head == p->shadow_tail) {
+    p->shadow_tail = p->tail.load(std::memory_order::acquire);
+    if (p->shadow_tail == head) {
+      return nullptr;
+    }
+  }
+
+  auto idx = (head & (p->block_count - 1));
+  auto ptr = p->free_list_entries[idx];
+  p->free_list_entries[idx] = (void *)0xFFFFFFFFFFFFFFFF;
+
+  p->head.store(head + 1, std::memory_order::release);
+  if (zeroed) {std::memset(ptr, 0, p->block_size);}
+  return ptr;
+}
+
+void pool_atomic_dealloc(PoolAllocatorSPSCFreeListSize *p, void *ptr)
+{
+  auto tail = p->tail.load(std::memory_order::relaxed);
+  #ifdef DEBUG_BUILD
+  auto head = p->head.load(std::memory_order::acquire);
+  assert(tail - head < p->block_count);
+  #endif
+
+  auto idx = (tail & (p->block_count - 1));
+  assert(p->free_list_entries[idx] == (void *)0xFFFFFFFFFFFFFFFF);
+  p->free_list_entries[idx] = (void *)ptr;
+
+
+  p->tail.store(tail + 1, std::memory_order::release);
+}
+
+
 template <typename T>
 /* NOTE(Ray):
  * This pool allocator uses an SPSC free list array to track free entries instead of the more traditional linked list approach
@@ -132,10 +229,11 @@ template <typename T>
 */
 struct PoolAllocatorSPSCFreeList {
   alignas(std::hardware_destructive_interference_size) std::atomic<uint64_t> head;
-  alignas(std::hardware_destructive_interference_size) std::atomic<uint64_t> shadow_tail;
+  alignas(std::hardware_destructive_interference_size) volatile uint64_t shadow_tail;
   alignas(std::hardware_destructive_interference_size) std::atomic<uint64_t> tail;
   T **free_list_entries;
-  uint64_t block_count;
+  int64_t block_count;
+  int64_t block_capacity;
   void *memory;
 };
 
@@ -158,7 +256,6 @@ void pool_init(PoolAllocatorSPSCFreeList<T> *p, size_t block_count, void *memory
 
 }
 
-
 template <typename T>
 void pool_init(PoolAllocatorSPSCFreeList<T> *p, size_t block_count, size_t alignment = 8) 
 {
@@ -171,14 +268,14 @@ void pool_init(PoolAllocatorSPSCFreeList<T> *p, size_t block_count, size_t align
 template <typename T>
 void pool_init(PoolAllocatorSPSCFreeList<T> *p, Arena *a, size_t block_count, size_t alignment = 8) 
 {
-	size_t memory_size = (sizeof(T) * block_count) + (sizeof(void *) * block_count);
+  size_t memory_size = (sizeof(T) * block_count) + (sizeof(void *) * block_count);
 	auto memory = arena_alloc(a, memory_size, alignment);
   pool_init(p, block_count, memory, memory_size);
 }
 
 
 template <typename T>
-T *pool_atomic_alloc(PoolAllocatorSPSCFreeList<T> *p, bool zeroed = true) 
+T *pool_atomic_alloc(PoolAllocatorSPSCFreeList<T> *p, bool zeroed = true)
 {
   auto head = p->head.load(std::memory_order::relaxed);
   if (head == p->shadow_tail) {
@@ -192,7 +289,7 @@ T *pool_atomic_alloc(PoolAllocatorSPSCFreeList<T> *p, bool zeroed = true)
   auto ptr = p->free_list_entries[idx];
   p->free_list_entries[idx] = (T *)0xFFFFFFFFFFFFFFFF;
 
-  p->head.fetch_add(1, std::memory_order::release);
+  p->head.store(head + 1, std::memory_order::release);
   if (zeroed) {std::memset(ptr, 0, sizeof(T));}
   return ptr;
 }
@@ -201,20 +298,16 @@ template <typename T>
 void pool_atomic_dealloc(PoolAllocatorSPSCFreeList<T> *p, void *ptr)
 {
   auto tail = p->tail.load(std::memory_order::relaxed);
-  auto head = p->head.load(std::memory_order::acquire);
-  assert(tail - head < p->block_count);
 
   auto idx = (tail & (p->block_count - 1));
   assert(p->free_list_entries[idx] == (T *)0xFFFFFFFFFFFFFFFF);
   p->free_list_entries[idx] = (T *)ptr;
+  p->tail.store(tail + 1, std::memory_order::release);
 
-
-  p->tail.fetch_add(1, std::memory_order::release);
 }
 
 struct PoolAllocatorFreeListNode {
 	PoolAllocatorFreeListNode *next;
-  uint32_t sig;
 };
 
 template <typename T>
@@ -233,11 +326,9 @@ void pool_init(PoolAllocator<T> *p, size_t block_count, void *memory, size_t mem
 
 	auto free_list_node = (PoolAllocatorFreeListNode *)p->memory;
 	p->head = free_list_node;
-  free_list_node->sig = 0xFEFEFEFE;
 	for (auto i = 1; i < block_count - 1; ++i) {
 		free_list_node->next = (PoolAllocatorFreeListNode *)((uint8_t *)p->memory + chunk_size * i);
 		free_list_node = free_list_node->next;
-    free_list_node->sig = 0xFEFEFEFE;
 	}
 
 	free_list_node->next = nullptr;
@@ -278,7 +369,7 @@ T *pool_alloc(PoolAllocator<T> *p, bool zeroed=true)
 }
 
 template <typename T>
-__declspec(noinline) T *pool_atomic_alloc(PoolAllocator<T> *p, bool zeroed=true) {
+T *pool_atomic_alloc(PoolAllocator<T> *p, bool zeroed=true) {
 
   /* NOTE(Ray)
     * The compiler only requires 8 bit alignment for these array fields, but cmpxchng16b requires 
@@ -299,7 +390,6 @@ __declspec(noinline) T *pool_atomic_alloc(PoolAllocator<T> *p, bool zeroed=true)
 		next_head[1] = block[1] + 1;
 
 		if (atomic_compare_and_swap_128_acq_rel(&p->head, next_head[1], next_head[0], block)) {
-      node_ptr->sig = 0;
       if (zeroed) {std::memset(node_ptr, 0, sizeof(T));}
 			return (T *)node_ptr; 
 		} 
@@ -326,15 +416,9 @@ void pool_atomic_dealloc(PoolAllocator<T> *p, void *ptr) {
 		alignas(16) uint64_t block[2];
 		block[0] = reinterpret_cast<uint64_t>(ptr);
 		block[1] = expected_head[1] + 1;
-    if (node_to_free->sig == 0xFEFEFEFE) {
-      assert(false);
-      __debugbreak();
-    }
-
 
 		if (atomic_compare_and_swap_128_acq_rel(&p->head, block[1],
 						    block[0], expected_head)) {
-      node_to_free->sig = 0xFEFEFEFE;
 			return;
 		}
 	}
@@ -566,6 +650,26 @@ StringSlice8 string_slice_length(StringSlice8 s, int64_t start_index = 0,
 }
 
 StringSlice8 string8_slice_to(String8 s, String8 to_string)
+{
+	StringSlice8 result = {};
+	auto match_idx = 0;
+	for (auto i = 0; i < s.length; ++i) {
+		if (to_string[match_idx] == s.content[i]) {
+			match_idx++;
+			if (match_idx == to_string.length) {
+				result.length = i - match_idx + 1;
+				result.content = (uint8_t *)s.content;
+				return result;
+			}
+		} else {
+			match_idx = 0;
+		}
+	}
+
+	return result;
+}
+
+StringSlice8 string8_slice_to(StringSlice8 s, String8 to_string)
 {
 	StringSlice8 result = {};
 	auto match_idx = 0;

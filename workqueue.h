@@ -5,7 +5,7 @@
 #include <thread>
 
 #include "utils.h"
-#include "metadata.h"
+#include "ingestion_worker.h"
 
 #define WRITER_QUEUE_SIZE (64u)
 
@@ -40,6 +40,8 @@ struct alignas(std::hardware_destructive_interference_size) MPMCWorkQueue {
 
 struct MPSCWriterQueueEntry {
   TableID table_id;
+  uint64_t start_timestamp;
+  uint64_t end_timestamp;
   RequestInfoAndPage request_info_and_page; 
   uint16_t thread_id;
 };
@@ -49,6 +51,7 @@ struct alignas(std::hardware_destructive_interference_size) MPSCWriterQueue {
   std::atomic<int64_t> *seq_nums;
 	int64_t capacity;
 	alignas(std::hardware_destructive_interference_size) std::atomic<int64_t> tail;
+  std::atomic<int64_t> worker_count;
 
   std::atomic<bool> stop_flag;
 };

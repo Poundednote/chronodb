@@ -2,7 +2,6 @@
 
 #include <stdio.h>
 #include <stdint.h>
-#include <atomic>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -22,6 +21,28 @@
     #define IS_ARM64 0
     #define IS_X64 1
 #endif
+
+#include <intrin.h>
+#if IS_ARM64
+#define store_release_8(ptr, val)  __strl8((volatile int *__int8)ptr, val)
+#define store_release_16(ptr, val) __strl16((volatile int * __int16)ptr, val)
+#define store_release_32(ptr, val) __strl32((volatile int * __int32)ptr, val)
+#define store_release_64(ptr, val) __strl64((volatile int * __int32)ptr, val)
+#define load_acquire_8(ptr, val)   __ldar8((volatile int *__int8)ptr)
+#define load_acquire_16(ptr)  __ldar16((volatile int * __int16)ptr)
+#define load_acquire_32(ptr)  __ldar32((volatile int * __int32)ptr)
+#define load_acquire_64(ptr)  __ldar64((volatile int * __int32)ptr)
+#else
+#define store_release_8(ptr, val)  (*ptr = val)
+#define store_release_16(ptr, val) (*ptr = val)
+#define store_release_32(ptr, val) (*ptr = val)
+#define store_release_64(ptr, val) (*ptr = val)
+#define load_acquire_8(ptr)   (*ptr)
+#define load_acquire_16(ptr)  (*ptr)
+#define load_acquire_32(ptr)  (*ptr)
+#define load_acquire_64(ptr)  (*ptr)
+#endif
+
 
 
 #if IS_ARM64
@@ -90,6 +111,18 @@
 #define PACKED_STRUCT_START __pragma(pack(push, 1))
 #define PACKED_STRUCT_END __pragma(pack(pop))
 
+void set_end_of_file(OSHandle file_handle)
+{
+  SetEndOfFile(file_handle.os_handle);
+}
+
+int32_t set_file_pointer_from_start(OSHandle file_handle, int64_t offset)
+{
+  LONG offset_high = offset >> 32;
+  auto new_pointer_low = SetFilePointer(file_handle.os_handle, offset & 0xFFFFFFFF, &offset_high, FILE_BEGIN);
+  return (new_pointer_low & (offset_high << 31));
+}
+
 int64_t get_filesize(const char *path) {
 
 	HANDLE fh = CreateFile(path, GENERIC_READ, FILE_SHARE_READ, NULL,
@@ -111,7 +144,7 @@ OSHandle create_file(const char *path, bool is_async)
 {
   
   DWORD flags = is_async ? FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED : FILE_ATTRIBUTE_NORMAL;
-	HANDLE fh = CreateFile(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL,
+	HANDLE fh = CreateFile(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
 		   OPEN_ALWAYS, flags, NULL);
 
 	return fh == INVALID_HANDLE_VALUE ? OSHandle{false, (void *)GetLastError()} : OSHandle{true, fh};
@@ -120,7 +153,7 @@ OSHandle create_file(const char *path, bool is_async)
 OSHandle create_file_direct_asio(const char *path)
 {
   
-	HANDLE fh = CreateFile(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL,
+	HANDLE fh = CreateFile(path, GENERIC_WRITE | GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
 		   OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING, NULL);
 
 	return fh == INVALID_HANDLE_VALUE ? OSHandle{false, (void *)GetLastError()} : OSHandle{true, fh};
@@ -145,13 +178,15 @@ int read_entire_file(const char *path, void *buffer, size_t buffer_size) {
 	return success ? result : 0;
 }
 
-void memory_map_file_handle_read_only(MemoryMappedFile *mmf, OSHandle handle, int64_t filesize) 
+
+
+void memory_map_file_handle_read_only(MemoryMappedFile *mmf, OSHandle handle, int64_t offset, int64_t size) 
 {
 	HANDLE fh = handle.os_handle;
 
 	HANDLE mapping_handle =
 		CreateFileMappingA(fh, NULL, PAGE_READONLY,
-				   filesize >> 32, filesize & 0x00000000FFFFFFFF, NULL);
+				   size >> 32, size & 0xFFFFFFF, NULL);
 
 
 	if (mapping_handle == NULL) {
@@ -163,12 +198,10 @@ void memory_map_file_handle_read_only(MemoryMappedFile *mmf, OSHandle handle, in
 	void *file_memory = MapViewOfFile(
 		mapping_handle,
 		FILE_MAP_READ,
-		0, 0, 0);
+		offset >> 32, offset & 0xFFFFFFFF, size);
 
 	CloseHandle(mapping_handle);
-	CloseHandle(fh);
-
-	*mmf = MemoryMappedFile{handle, file_memory, filesize, filesize, MMFileAccess::READ};
+	*mmf = MemoryMappedFile{handle, file_memory, offset, offset, MMFileAccess::READ};
 }
 
 void memory_map_entire_file_read_only(MemoryMappedFile *mmf, const char *filepath) 
@@ -187,7 +220,7 @@ void memory_map_entire_file_read_only(MemoryMappedFile *mmf, const char *filepat
 		return; 
 	}
 
-	memory_map_file_handle_read_only(mmf, OSHandle{true, fh}, filesize);
+	memory_map_file_handle_read_only(mmf, OSHandle{true, fh}, 0, filesize);
 }
 
 
@@ -227,10 +260,42 @@ void memory_map_file_handle_append(MemoryMappedFile *mmf, OSHandle handle, int64
 	*mmf = MemoryMappedFile{handle, file_memory, mapping_size, *(int64_t *)(&file_size.QuadPart), MMFileAccess::WRITE};
 }
 
+void memory_map_file_handle_read_write(MemoryMappedFile *mmf, OSHandle file_handle, int64_t offset, int64_t size) 
+{
+	HANDLE fh = file_handle.os_handle;
+	*mmf = {};
+
+	if (!fh) {
+		fprintf(stderr, "Error: Could not open file\n");
+		return;
+	}
+
+	HANDLE mapping_handle =
+		CreateFileMappingA(fh, NULL, PAGE_READWRITE,
+				   size >> 32, size & 0x00000000FFFFFFFF, NULL);
+
+
+	if (mapping_handle == NULL) {
+		fprintf(stderr, "Error: Could not create file mapping\n");
+		CloseHandle(fh);
+		return;
+	}
+
+	void *file_memory = MapViewOfFile(
+		mapping_handle,
+		FILE_MAP_READ | FILE_MAP_WRITE,
+		offset >> 32, offset & 0xFFFFFFFF, size);
+
+	CloseHandle(mapping_handle);
+
+	*mmf = MemoryMappedFile{file_handle, file_memory, size, size, MMFileAccess::WRITE};
+}
+
+
 void memory_map_entire_file_append(MemoryMappedFile *mmf, const char *filepath, int64_t append_size) 
 {
 	*mmf = {};
-	HANDLE fh = CreateFileA(filepath, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+	HANDLE fh = CreateFileA(filepath, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_WRITE, NULL,
 				OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
 
 	if (fh == INVALID_HANDLE_VALUE) {
@@ -301,22 +366,25 @@ uint64_t platform_high_res_timer_freq()
   return freq.QuadPart;
 }
 
+enum class SubmissionQueueOPS: uint32_t {
+  READ,
+  WRITE,
+};
 struct SubmissionQueueEntry {
   uint64_t user_data;
   OSHandle file_handle;
   OVERLAPPED overlapped;
   void *buffer;
   uint64_t buffer_size;
-  uint64_t offset_to_write;
+  uint64_t offset;
+  SubmissionQueueOPS op_type;
   bool active;
-  
 };
 
 typedef SubmissionQueueEntry CompletionQueueEntry;
 
 struct SubmissionQueue {
   SubmissionQueueEntry *entries;
-  ULONGLONG head;
   ULONGLONG tail;
   LONGLONG capacity;
 };
@@ -369,24 +437,20 @@ bool platform_asio_submit_write(ASIOContext *context, OSHandle file_handle, uint
 	DWORD bytes_written = 0;
 
   auto &submission_queue = context->submission_queue;
+  auto queue_slot = &submission_queue->entries[_platform_get_asio_queue_slot_idx(submission_queue->tail, submission_queue->capacity)];
 
-  if (submission_queue->tail - submission_queue->head >= submission_queue->capacity) {
-    auto head_of_queue_entry = &submission_queue->entries[_platform_get_asio_queue_slot_idx(submission_queue->head, submission_queue->capacity)];
-    if (HasOverlappedIoCompleted(&head_of_queue_entry->overlapped) && head_of_queue_entry->active) {
-      return false;
-    }
-    ++submission_queue->head;
-  }
+	if (queue_slot->active) {
+		return false;
+	}
 
-  auto queue_slot = &submission_queue->entries[_platform_get_asio_queue_slot_idx(submission_queue->tail++, submission_queue->capacity)];
-
+  queue_slot->op_type = SubmissionQueueOPS::WRITE;
   queue_slot->overlapped.Offset = file_offset & 0x00000000FFFFFFFF;
   queue_slot->overlapped.OffsetHigh = (file_offset) >> 32;
   queue_slot->user_data = user_data;
   queue_slot->file_handle = file_handle;
   queue_slot->buffer_size = buffer_size;
   queue_slot->buffer = buffer;
-  queue_slot->offset_to_write = file_offset;
+  queue_slot->offset = file_offset;
   queue_slot->active = true;
 
   auto result = WriteFile(
@@ -396,6 +460,7 @@ bool platform_asio_submit_write(ASIOContext *context, OSHandle file_handle, uint
     nullptr,
     &queue_slot->overlapped
   );
+  ++submission_queue->tail;
 
   return true;
 }
@@ -413,9 +478,9 @@ void platform_asio_fill_multiple_buffer_info(BufferInfo *info, void *buffer, siz
   }
 }
 
-void *platform_asio_get_buffer_from_info(BufferInfo *info) 
+void **platform_asio_get_buffer_from_info(BufferInfo *info) 
 {
-  return info->Buffer;
+  return &info->Buffer;
 }
 
 
@@ -423,48 +488,43 @@ bool platform_asio_submit_write_buffer_info_array(ASIOContext *context, OSHandle
 																									BufferInfo *buffer_array, size_t total_bytes_to_write,
 																									uint64_t user_data)
 {
-	{
-		assert(file_offset % 4096 == 0);
-		DWORD bytes_written = 0;
+	assert(file_offset % 4096 == 0);
+  assert(total_bytes_to_write % 4096 == 0); // must be a multiple of sector size
+	DWORD bytes_written = 0;
 
-		auto &submission_queue = context->submission_queue;
+	auto &submission_queue = context->submission_queue;
 
-		if (submission_queue->tail - submission_queue->head >= submission_queue->capacity) {
-			auto head_of_queue_entry =
-				&submission_queue->entries[_platform_get_asio_queue_slot_idx(submission_queue->head, submission_queue->capacity)];
-			if (HasOverlappedIoCompleted(&head_of_queue_entry->overlapped) && head_of_queue_entry->active) {
-				return false;
-			}
-			++submission_queue->head;
-		}
-
-		auto queue_slot =
-			&submission_queue->entries[_platform_get_asio_queue_slot_idx(submission_queue->tail++, submission_queue->capacity)];
-
-		queue_slot->overlapped.Offset = file_offset & 0x00000000FFFFFFFF;
-		queue_slot->overlapped.OffsetHigh = (file_offset) >> 32;
-		queue_slot->user_data = user_data;
-		queue_slot->file_handle = file_handle;
-		queue_slot->buffer_size = total_bytes_to_write;
-		queue_slot->buffer = buffer_array;
-		queue_slot->offset_to_write = file_offset;
-    queue_slot->active = true;
-
-		auto result = WriteFileGather((HANDLE)file_handle.os_handle, (FILE_SEGMENT_ELEMENT *)buffer_array, total_bytes_to_write, NULL, &queue_slot->overlapped);
-    auto err = GetLastError();
-    if (err != ERROR_IO_PENDING) {
-      return false;
-    }
-    
-
-		return true;
+  auto queue_slot = &submission_queue->entries[_platform_get_asio_queue_slot_idx(submission_queue->tail, submission_queue->capacity)];
+	if (queue_slot->active) {
+		return false;
 	}
+
+  queue_slot->op_type = SubmissionQueueOPS::WRITE;
+	queue_slot->overlapped.Offset = file_offset & 0x00000000FFFFFFFF;
+	queue_slot->overlapped.OffsetHigh = (file_offset) >> 32;
+	queue_slot->user_data = user_data;
+	queue_slot->file_handle = file_handle;
+	queue_slot->buffer_size = total_bytes_to_write;
+	queue_slot->buffer = buffer_array;
+	queue_slot->offset = file_offset;
+	queue_slot->active = true;
+
+	auto result = WriteFileGather((HANDLE)file_handle.os_handle, (FILE_SEGMENT_ELEMENT *)buffer_array,
+																total_bytes_to_write, NULL, &queue_slot->overlapped);
+	auto err = GetLastError();
+	if (err != ERROR_IO_PENDING) {
+    fprintf(stderr, "Failed to submit batched IO operation check the disk is not full\n");
+		return false;
+	}
+
+	return true;
+  ++submission_queue->tail;
 }
 
 inline CompletionQueueEntry *platform_asio_completed_entry_dequeue(ASIOContext *context) {
   auto &completion_queue = context->completion_queue;
-	for (auto i = completion_queue->head; i < completion_queue->tail; ++i) {
-		auto queue_slot = &completion_queue->entries[_platform_get_asio_queue_slot_idx(i, completion_queue->capacity)];
+	for (auto i = 0; i < completion_queue->capacity; ++i) {
+		auto queue_slot = &completion_queue->entries[i];
     auto bytes_transfered = 0;
     if (queue_slot->active && HasOverlappedIoCompleted(&queue_slot->overlapped)) {
       queue_slot->active = false;
@@ -475,6 +535,48 @@ inline CompletionQueueEntry *platform_asio_completed_entry_dequeue(ASIOContext *
   return nullptr;
 }
 
+bool platform_asio_submit_read(ASIOContext *context, OSHandle file_handle, uint64_t file_offset, size_t bytes_to_read, void *buffer, size_t buffer_size, uint64_t user_data) 
+{ 
+  assert(buffer_size % 4096 == 0); // must be a multiple of sector size
+  assert((uintptr_t)buffer % 4096  == 0);
+  assert(file_offset % 4096 == 0);
+	DWORD bytes_written = 0;
+
+  auto &submission_queue = context->submission_queue;
+  auto queue_slot = &submission_queue->entries[_platform_get_asio_queue_slot_idx(submission_queue->tail, submission_queue->capacity)];
+
+	if (queue_slot->active) {
+		return false;
+	}
+
+  queue_slot->overlapped.Offset = file_offset & 0x00000000FFFFFFFF;
+  queue_slot->overlapped.OffsetHigh = (file_offset) >> 32;
+  queue_slot->user_data = user_data;
+  queue_slot->file_handle = file_handle;
+  queue_slot->buffer_size = buffer_size;
+  queue_slot->buffer = buffer;
+  queue_slot->offset = file_offset;
+  queue_slot->active = true;
+
+  auto result = ReadFile(
+    (HANDLE)file_handle.os_handle,
+    buffer,
+    bytes_to_read,
+    NULL,
+    &queue_slot->overlapped
+  );
+
+	auto err = GetLastError();
+	if (err != ERROR_IO_PENDING) {
+    fprintf(stderr, "Failed to submit batched IO operation check the disk is not full\n");
+		return false;
+	}
+
+  ++submission_queue->tail;
+
+  return true;
+}
+
 uint64_t platform_asio_completed_entry_get_bytes_transfered(CompletionQueueEntry *entry) {
   DWORD bytes_transfered = 0;
   GetOverlappedResult(entry->file_handle.os_handle, &entry->overlapped, &bytes_transfered,
@@ -483,7 +585,17 @@ uint64_t platform_asio_completed_entry_get_bytes_transfered(CompletionQueueEntry
   return bytes_transfered;
 }
 
+void *page_allocator_commit(void *address, size_t bytes) 
+{
+  return VirtualAlloc(address, bytes, MEM_COMMIT, PAGE_READWRITE);
+}
+
 void *page_allocator_alloc(size_t bytes) 
 {
   return VirtualAlloc(0, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+}
+
+void *page_allocator_reserve(size_t bytes) 
+{
+  return VirtualAlloc(0, bytes, MEM_RESERVE, PAGE_READWRITE);
 }

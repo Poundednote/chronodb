@@ -11,7 +11,6 @@
 #include "context.h"
 #include "writer.h"
 #include "workqueue.h"
-#include "src/optick.h"
 
 MPSCWriterQueue *_get_writer_queue_from_version(WriterQueues *queues, uint64_t version) 
 {
@@ -29,17 +28,22 @@ void writer_queues_enqueue_entry(WriterQueues *queues, MPSCWriterQueueEntry *ent
   auto queue_to_submit = _get_worker_submit_queue(queues);
 
 	while (queue_to_submit->tail.load(std::memory_order::acquire) >= queue_to_submit->capacity) {
-
 		queue_to_submit = _get_worker_submit_queue(queues);
 	}
 
+  queue_to_submit->worker_count.fetch_add(1, std::memory_order::release);
 	mpsc_writer_enqueue(queue_to_submit, entry);
+  queue_to_submit->worker_count.fetch_sub(1, std::memory_order::release);
 }
 
 MPSCWriterQueue *writer_queues_swap_active_queue_return_previous(WriterQueues *queues)
 {
   uint64_t prev_version = queues->active_version.fetch_add(1, std::memory_order::release);
-  auto *queue = _get_writer_queue_from_version(queues, prev_version);
+  auto queue = _get_writer_queue_from_version(queues, prev_version);
+  while (queue->worker_count.load(std::memory_order_acquire)) {
+    cpu_pause();
+  }
+
   return queue;
 }
 
@@ -73,31 +77,31 @@ SchemaMaps *copy_old_map_to_new_slot(SchemaCacheTrippleBuffer *maps)
   return new_map;
 }
 
-void process_completed_writes(ASIOContext *asio_context, PoolAllocator<BatchedIOInfo> *batched_info_pool, IngestionWorkerContext *iw_ctx_arr) 
+void process_completed_writes(ASIOContext *asio_context, HotPartitionInfo *hot_partition_info_map, PoolAllocator<BatchedIOInfo> *batched_info_pool, IngestionWorkerContext *iw_ctx_arr) 
 {
   for (auto entry = platform_asio_completed_entry_dequeue(asio_context);
        entry != nullptr; entry = platform_asio_completed_entry_dequeue(asio_context)) {
     if (entry->buffer_size != platform_asio_completed_entry_get_bytes_transfered(entry)) {
       // try again
-			platform_asio_submit_write_buffer_info_array(asio_context, entry->file_handle, entry->offset_to_write,
+			platform_asio_submit_write_buffer_info_array(asio_context, entry->file_handle, entry->offset,
 																									 (BufferInfo *)entry->buffer, entry->buffer_size, entry->user_data);
 
 		} else {
       auto ingestion_worker_schema_maps = &iw_ctx_arr[entry->user_data].schema_maps;
       auto batched_io_info = (BatchedIOInfo *)entry->buffer; 
       auto full_pages_count = batched_io_info->total_bytes / DATA_PAGE_SIZE;
-      auto full_page_entry_count = platform_asio_get_buffer_info_entry_count_from_buffer_size(DATA_PAGE_SIZE);
+      auto full_page_entry_count = DATA_PAGE_SIZE / BUFFER_INFO_SLOT_DATA_SIZE;
+      auto header = (HotPartitionHeader *)hot_partition_info_map[batched_io_info->table_id.index].header_mapping.mapping;
       for (int i = 0; i < batched_io_info->buffer_info_count; i += full_page_entry_count) {
         auto buffer = platform_asio_get_buffer_from_info(&batched_io_info->buffer_info_array[i]);
-        pool_atomic_dealloc(&ingestion_worker_schema_maps->data_page_pool, buffer);
+        pool_atomic_dealloc(&ingestion_worker_schema_maps->data_page_pool, *buffer);
+        *buffer = 0;
       }
 
-      
-			if (batched_io_info->total_bytes % DATA_PAGE_SIZE) {
-        auto last_page_idx = full_pages_count * full_page_entry_count;
-        auto buffer = platform_asio_get_buffer_from_info(&batched_io_info->buffer_info_array[last_page_idx]);
-        pool_atomic_dealloc(&ingestion_worker_schema_maps->data_page_pool, buffer);
-      };
+      for (int i = 0; i < full_pages_count; ++i) {
+				header->data_page_offsets[batched_io_info->page_slot_in_array_index_start + i] =
+					batched_io_info->file_offset + i * DATA_PAGE_SIZE;
+			}
 
 			pool_dealloc(batched_info_pool, batched_io_info);
     }
@@ -216,6 +220,23 @@ HotPartitionInfo *get_hot_partition_file_info_or_create(HotPartitionInfo *hot_pa
 		create_directory((const char *)table_dir_name.content); // assume it doesn't exist so create it
 
 		hot_partition_info.file_offset = get_filesize((const char *)hot_partition_path.content);
+    auto aligned_size_of_header = align_size_forward_pow2(sizeof(HotPartitionHeader), KILOBYTES(4));
+    auto file_handle = create_file((const char *)hot_partition_path.content, false);
+    
+		// If the file didn't exist or has no data map the header and add its offset
+    if (hot_partition_info.file_offset == 0) {
+      set_file_pointer_from_start(file_handle, aligned_size_of_header);
+      set_end_of_file(hot_partition_file_handles->header_mapping.handle);
+      hot_partition_info.file_offset = aligned_size_of_header;
+    } 
+    assert(hot_partition_info.file_offset >= aligned_size_of_header);
+
+    memory_map_file_handle_read_write(&hot_partition_info.header_mapping, file_handle, 0, aligned_size_of_header);
+    auto header = (HotPartitionHeader *)hot_partition_info.header_mapping.mapping;
+		if (header->total_bytes_written == 0) {
+			header->total_bytes_written = aligned_size_of_header;
+		}
+
 		hot_partition_info.file_handle = create_file_direct_asio((const char *)hot_partition_path.content);
 
 		if (!hot_partition_info.file_handle.valid) {
@@ -236,7 +257,7 @@ void writer_queues_advance_version_and_process_queue(DatabaseContext *db_context
 
   std::sort(processing_queue->entries,
             processing_queue->entries + tail,
-            [](MPSCWriterQueueEntry a, MPSCWriterQueueEntry b) { return a.table_id.index > b.table_id.index; });
+            [](MPSCWriterQueueEntry a, MPSCWriterQueueEntry b) { return a.end_timestamp < b.end_timestamp; });
 
   bool should_inc_maps_version = false;
   for (int i = 0; i < tail; ++i) {
@@ -253,11 +274,21 @@ void writer_queues_advance_version_and_process_queue(DatabaseContext *db_context
 
 
     auto table_id = entry.table_id;
+		auto hot_partition_info = get_hot_partition_file_info_or_create(
+			db_context->hot_partition_file_handles, db_context, &writer_context->transient_arena, table_id,
+			StringSlice8{ request_info->table_name.buffer, request_info->table_name.length });
+    auto hot_partition_header = (HotPartitionHeader *)hot_partition_info->header_mapping.mapping;
+
     auto batched_io_info = pool_alloc(&writer_context->batched_info_pool);
+    batched_io_info->table_id = entry.table_id;
+    batched_io_info->page_slot_in_array_index_start = hot_partition_header->data_page_count;
+    batched_io_info->file_offset = hot_partition_header->total_bytes_written;
+
     while (current_page) {
       auto total_bytes = 0;
       auto page_header = (DataPageHeader *)current_page;
       page_header->column_count = 0; // always reset to 0
+    // TODO(Ray): Move this shit out of the while loop because it only needs to happen ONCE
       if (entry.table_id.local_flag) {
         table_id = schema_maps_lookup_table_id(schema_maps, { request_info->table_name.buffer,
                                                               request_info->table_name.length });
@@ -307,55 +338,82 @@ void writer_queues_advance_version_and_process_queue(DatabaseContext *db_context
       // TODO(Ray): Get the sector size from the OS at some point
 
       // prepare the page
-      total_bytes += page_header->bytes_written - sizeof(DataPageHeader);
-      size_t aligned_size = (page_header->bytes_written + (KILOBYTES(4) - 1)) & ~(KILOBYTES(4) - 1);
+      size_t aligned_size = align_size_forward_pow2(page_header->bytes_written, KILOBYTES(4));
+      assert(aligned_size >= page_header->bytes_written);
       auto bytes_to_zero = aligned_size - page_header->bytes_written;
-      std::memset(current_page->data + page_header->row_write_offset, 0, bytes_to_zero);
-      auto ingestion_schema_maps = &db_context->thread_context_array[entry.thread_id].schema_maps;
-      auto next_page = (DataPage *)page_header->next_page;
-      assert(*(current_page->data + page_header->row_write_offset) == 0);
+      std::memset(current_page + page_header->bytes_written, 0, bytes_to_zero);
+      auto next_page = (uint8_t *)page_header->next_page;
+      assert(*(current_page + page_header->bytes_written) == 0);
 
       auto buffer_info_entry_count = platform_asio_get_buffer_info_entry_count_from_buffer_size(aligned_size);
 			if (batched_io_info->buffer_info_count + buffer_info_entry_count > BUFFER_INFO_ARRAY_SIZE) {
-				auto hot_partition_info = get_hot_partition_file_info_or_create(
-					writer_context->hot_partition_file_handles, db_context, &writer_context->transient_arena, table_id,
-					StringSlice8{ request_info->table_name.buffer, request_info->table_name.length });
+				auto full_page_count = batched_io_info->buffer_info_count / (DATA_PAGE_SIZE / BUFFER_INFO_SLOT_DATA_SIZE);
+				auto end_page = batched_io_info->buffer_info_count % (DATA_PAGE_SIZE / BUFFER_INFO_SLOT_DATA_SIZE) != 0;
+				auto total_pages = full_page_count + end_page;
+				assert(total_pages <= PAGES_PER_INFO_ARRAY);
+
+				for (int i = 0; i < total_pages; ++i) {
+					hot_partition_header->timestamp_intervals[batched_io_info->page_slot_in_array_index_start + i] =
+						batched_io_info->timestamp_intervals[i];
+					hot_partition_header->data_page_sizes[batched_io_info->page_slot_in_array_index_start + i] = batched_io_info->page_sizes[i];
+				}
+
 
 				while (!platform_asio_submit_write_buffer_info_array(
 					&writer_context->asio_context, hot_partition_info->file_handle, hot_partition_info->file_offset,
 					batched_io_info->buffer_info_array, batched_io_info->total_bytes, entry.thread_id)) {
-					process_completed_writes(&writer_context->asio_context, &writer_context->batched_info_pool, db_context->thread_context_array);
+					process_completed_writes(&writer_context->asio_context, db_context->hot_partition_file_handles, &writer_context->batched_info_pool, db_context->thread_context_array);
 				}
-
+				store_release_64(&hot_partition_header->data_page_count, hot_partition_header->data_page_count += total_pages);
+        store_release_64(&hot_partition_header->total_bytes_written, hot_partition_header->total_bytes_written + batched_io_info->total_bytes);
 				hot_partition_info->file_offset += batched_io_info->total_bytes;
+
         batched_io_info = pool_alloc(&writer_context->batched_info_pool);
+        batched_io_info->table_id = entry.table_id;
+        batched_io_info->file_offset = hot_partition_info->file_offset;
+        batched_io_info->page_slot_in_array_index_start = hot_partition_header->data_page_count;
 			}
 
 			auto *buffer_info = &batched_io_info->buffer_info_array[batched_io_info->buffer_info_count];
+      auto timestamp_idx = (batched_io_info->buffer_info_count) / (DATA_PAGE_SIZE  / BUFFER_INFO_SLOT_DATA_SIZE);
       platform_asio_fill_multiple_buffer_info(buffer_info, current_page, buffer_info_entry_count);
+
       batched_io_info->total_bytes += aligned_size;
       batched_io_info->buffer_info_count += buffer_info_entry_count;
-      
+      batched_io_info->timestamp_intervals[timestamp_idx] = {.start_timestamp = page_header->start_timestamp, .end_timestamp = page_header->end_timestamp};
+      batched_io_info->page_sizes[timestamp_idx] = aligned_size;
       page_header->next_page = aligned_size;
       current_page = next_page;
     }
 
-		auto hot_partition_info = get_hot_partition_file_info_or_create(
-			writer_context->hot_partition_file_handles, db_context, &writer_context->transient_arena, table_id,
-			StringSlice8{ request_info->table_name.buffer, request_info->table_name.length });
+		auto full_page_count = batched_io_info->buffer_info_count / (DATA_PAGE_SIZE / BUFFER_INFO_SLOT_DATA_SIZE);
+    auto end_page = batched_io_info->buffer_info_count % (DATA_PAGE_SIZE / BUFFER_INFO_SLOT_DATA_SIZE) != 0;
+    auto total_pages = full_page_count + end_page;
+		assert(full_page_count <= PAGES_PER_INFO_ARRAY);
+		hot_partition_header->data_page_count += batched_io_info->buffer_info_count / total_pages;
+
+		for (int i = 0; i < total_pages; ++i) {
+			hot_partition_header->timestamp_intervals[batched_io_info->page_slot_in_array_index_start + i] =
+				batched_io_info->timestamp_intervals[i];
+		}
+
+		store_release_64(&hot_partition_header->data_page_count, hot_partition_header->data_page_count += total_pages);
 
 		while (!platform_asio_submit_write_buffer_info_array(
 			&writer_context->asio_context, hot_partition_info->file_handle, hot_partition_info->file_offset,
 			batched_io_info->buffer_info_array, batched_io_info->total_bytes, entry.thread_id)) {
-      process_completed_writes(&writer_context->asio_context, &writer_context->batched_info_pool, db_context->thread_context_array);
+      process_completed_writes(&writer_context->asio_context, db_context->hot_partition_file_handles, &writer_context->batched_info_pool, db_context->thread_context_array);
 		}
+    store_release_64(&hot_partition_header->total_bytes_written, hot_partition_header->total_bytes_written + batched_io_info->total_bytes);
+    hot_partition_info->file_offset += batched_io_info->total_bytes;
 
 		auto ingestion_schema_maps = &db_context->thread_context_array[entry.thread_id].schema_maps;
     pool_atomic_dealloc(&ingestion_schema_maps->per_table_request_info_pool, request_info);
   }
 
   if (should_inc_maps_version) {
-      db_context->schema_maps_tripple_buffer.version_number.fetch_add(1, std::memory_order::release);
+      auto version = db_context->schema_maps_tripple_buffer.version_number.load(std::memory_order::relaxed);
+      db_context->schema_maps_tripple_buffer.version_number.store(version + 1, std::memory_order::release);
   }
 
   processing_queue->tail.store(0, std::memory_order::release);
@@ -388,7 +446,7 @@ void writer_queue_start_routine(DatabaseContext *db_context, WriterContext *writ
 		if (should_swap) {
       writer_queues_advance_version_and_process_queue(db_context, writer_context);
 		} else {
-      process_completed_writes(&writer_context->asio_context, &writer_context->batched_info_pool, db_context->thread_context_array);
+      process_completed_writes(&writer_context->asio_context, db_context->hot_partition_file_handles, &writer_context->batched_info_pool, db_context->thread_context_array);
     }
 	}
 

@@ -3,3 +3,4 @@ build/
 work/
 radproject
 TEST_DB/
+out.txt
