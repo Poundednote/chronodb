@@ -10,6 +10,7 @@ IF "%1" == "tests" (
 	cl %CommonCompilerFlags% test_generation.cpp 
 	cl %CommonCompilerFlags% /O2 main.cpp 
   mkdir TEST_DB
+  del .\out.txt
   .\build\test_generation.exe
   python filegen.py exist
   .\build\main.exe 1
