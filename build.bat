@@ -26,5 +26,5 @@ IF "%1" == "tests" (
   .\build\main.exe 6
   del .\TEST_DB\tables\table0\active_partition.data
 ) ELSE (
-	cl %CommonCompilerFlags% /Od main.cpp 
+	cl %CommonCompilerFlags% /O2 main.cpp 
 )

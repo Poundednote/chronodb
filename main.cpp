@@ -193,45 +193,182 @@ int main(int argc, char *argv[])
 
   new (writer_thread) std::thread(writer_queue_start_routine, db_context, writer_thread_context);
 
-	// read entire file
-	auto filesize = get_filesize("outfile.data");
-	char *buffer = (char *)arena_alloc(&main_arena, filesize + 1);
-	size_t bytes_read = read_entire_file("outfile.data", buffer, filesize);
-	buffer[filesize] = 0; // null terminator
-	uint64_t string_size = filesize;
+  fprintf(stderr, "DB initilised\n");
+	for (;;) {
+		fprintf(stderr, "> ");
 
-  double thread_time_acc[2] = {};
-  double submission_time_acc = 0;
+		char in_buff[512] = {};
+		fgets(in_buff, 512, stdin);
+		fprintf(stderr, "%s", in_buff);
+		StringSlice8 command = {};
+		for (char *c = in_buff; *c != 0; ++c) {
+			if (*c == ' ') {
+				command.content = (uint8_t *)in_buff;
+				command.length = (ptrdiff_t)(c - in_buff);
+				break;
+			}
+		}
 
-  mpmc_begin_producer(&io_queue);
+		if (command.length == 0) {
+			fprintf(stderr, "Not a valid operation\n");
+		}
 
-  int max_chunks = 20;
-  auto submission_start = platform_get_high_res_timer_stamp();
-  for (int iter = 0; iter < 1; ++iter) {
-    for (int i = 0; i < max_chunks; ++i) {
-      int chunk_size = filesize / max_chunks;
-      char *buffer_chunk_start = buffer + i * chunk_size;
-      MPMCWorkQueuePayload entry = {};
-      FakeRequestHandleArgs *args = arena_alloc_struct(&main_arena, FakeRequestHandleArgs);
-      args->data = buffer_chunk_start;
-      args->data_size = chunk_size;
-      args->data_dict_file = data_dict_file;
-      args->context = db_context;
+		StringSlice8 arg_val = {};
+		for (char *c = (char *)(command.content + command.length + 1);; ++c) {
+			if (*c == 0) {
+        arg_val.content = command.content + command.length + 1;
+				arg_val.length = (ptrdiff_t)(c - (char *)(command.content + command.length + 1) - 1);
+				break;
+			}
+		}
 
-      entry.callback = fake_request_handle;
-      entry.callback_args = args;
-      mpmc_work_queue_enqueue_entry(&io_queue, entry);
+		if (command == string8_from_cstring("ingest")) {
+			// read entire file
+      StringBuilder8 sb_filename = {};
+      string_builder8_init(&main_arena, &sb_filename, 512);
+      string_builder8_append(&sb_filename, arg_val);
+      char *in_filename = (char *)sb_filename.content;
+			auto filesize = get_filesize(in_filename);
+			char *buffer = (char *)arena_alloc(&main_arena, filesize + 1);
+			size_t bytes_read = read_entire_file(in_filename, buffer, filesize);
+			buffer[filesize] = 0; // null terminator
+			uint64_t string_size = filesize;
+
+			double thread_time_acc[2] = {};
+			double submission_time_acc = 0;
+
+			mpmc_begin_producer(&io_queue);
+
+			int max_chunks = 20;
+			auto submission_start = platform_get_high_res_timer_stamp();
+			for (int iter = 0; iter < 1; ++iter) {
+				for (int i = 0; i < max_chunks; ++i) {
+					int chunk_size = filesize / max_chunks;
+					char *buffer_chunk_start = buffer + i * chunk_size;
+					MPMCWorkQueuePayload entry = {};
+					FakeRequestHandleArgs *args = arena_alloc_struct(&main_arena, FakeRequestHandleArgs);
+					args->data = buffer_chunk_start;
+					args->data_size = chunk_size;
+					args->data_dict_file = data_dict_file;
+					args->context = db_context;
+
+					entry.callback = fake_request_handle;
+					entry.callback_args = args;
+					mpmc_work_queue_enqueue_entry(&io_queue, entry);
+				}
+				mpmc_end_producer(&io_queue);
+			}
+
+			mpmc_work_queue_stop(&io_queue);
+			mpmc_work_queue_spinlock_till_finished(&io_queue);
+
+			writer_thread_context->stop_flag.store(true, std::memory_order::release);
+			while (!writer_thread_context->finished.load(std::memory_order::acquire)) {
+				writer_thread_context->finished.wait(writer_thread_context->finished);
+			}
+
+			auto submission_end = platform_get_high_res_timer_stamp();
+
+			for (int i = 0; i < thread_count; ++i) {
+				auto avg_diff = (double)thread_context_array[i].timer_diffs / (double)thread_context_array[i].run_count;
+				fprintf(stderr, "Avg time thread %d: %fms, runs: %I64d\n", i,
+								((double)avg_diff / (double)platform_high_res_timer_freq()) * 1000, thread_context_array[i].run_count);
+			}
+
+			auto avg_writer_diff = writer_thread_context->timer_diffs / writer_thread_context->run_count;
+			fprintf(stderr, "Avg writer thread time: %fms, runs: %I64d\n",
+							((double)avg_writer_diff / (double)platform_high_res_timer_freq()) * 1000,
+							writer_thread_context->run_count);
+			fprintf(stderr, "\n\nTotal time elapsed from start to end: %fms, \n",
+							compute_time_in_ms(submission_start, platform_get_high_res_timer_stamp()));
+		} else if (command == string8_from_cstring("get")) {
+			auto page_header = (DataPageHeader *)page_allocator_alloc(DATA_PAGE_SIZE);
+			ASIOContext asio_context = {};
+			platform_asio_create(&asio_context);
+			auto submission_start = platform_get_high_res_timer_stamp();
+
+			auto read_max_runs = 1;
+			auto read_avg_diff = 0;
+			for (int i = 0; i < read_max_runs; ++i) {
+				auto start_read_time = platform_get_high_res_timer_stamp();
+				auto schema_maps_result = schema_maps_get_latest_version_inc_refcount(&db_context->schema_maps_tripple_buffer);
+				auto schema_map = schema_maps_result.maps;
+				auto table_id = schema_maps_lookup_table_id(schema_map, string8_from_cstring("temperature"));
+				assert(table_id.id != 0);
+				auto &hot_partition_info = db_context->hot_partition_file_handles[table_id.index];
+				auto file_header = (HotPartitionHeader *)hot_partition_info.header_mapping.mapping;
+				auto data_page_count = load_acquire_64(&file_header->data_page_count);
+				int64_t timestamp = 0;
+				std::from_chars((char *)arg_val.content, (char *)arg_val.content + arg_val.length, timestamp);
+
+				auto found = false;
+				auto found_idx = 0;
+
+				MemoryMappedFile memory_map_page = {};
+				for (int i = 0; i < data_page_count; ++i) {
+					if (timestamp >= file_header->timestamp_intervals[i].start_timestamp &&
+							timestamp <= file_header->timestamp_intervals[i].end_timestamp) {
+						found = true;
+						found_idx = i;
+						break;
+					}
+				}
+
+				platform_asio_submit_read(&asio_context, hot_partition_info.file_handle,
+																	file_header->data_page_offsets[found_idx], DATA_PAGE_SIZE, page_header,
+																	DATA_PAGE_SIZE, 0);
+
+				auto entry = platform_asio_completed_entry_dequeue(&asio_context);
+				while (entry == nullptr) {
+					entry = platform_asio_completed_entry_dequeue(&asio_context);
+				}
+
+				auto row_ptr = (uint8_t *)page_header + sizeof(DataPageHeader);
+				while (row_ptr < row_ptr + page_header->bytes_written) {
+					if (*(uint64_t *)(row_ptr + *(uint64_t *)row_ptr - 8) == timestamp) {
+						for (int i = 0; i < page_header->column_count; ++i) {
+							auto col_ptr = row_ptr + page_header->column_offsets[i] + 8;
+							auto col_type = page_header->column_data[i].type;
+							auto col_id = page_header->column_data[i].id;
+
+							fprintf(stderr, "col id: %llu, ", *(uint64_t *)&col_id);
+							fprintf(stderr, "col type: %s, ", COLUMN_TYPE_STRINGS[(int)col_type]);
+							switch (col_type) {
+							case ColumnDataType::VARCHAR: {
+								fprintf(stderr, "col data: ");
+								auto length = *(uint64_t *)col_ptr;
+								col_ptr += 8;
+								for (int c_idx = 0; c_idx < length; ++c_idx) {
+									fprintf(stderr, "%c", *(col_ptr + c_idx));
+								}
+							} break;
+							case ColumnDataType::INT64:
+								fprintf(stderr, "%lli", *(int64_t *)col_ptr);
+								break;
+							default:
+								break;
+							}
+              fprintf(stderr, " ");
+						}
+						fprintf(stderr, "\n");
+						//fprintf(stderr, "found timestamp 11111\n");
+						break;
+					}
+					row_ptr += *(uint64_t *)row_ptr;
+				}
+
+				read_avg_diff += platform_get_high_res_timer_stamp() - start_read_time;
+
+				assert(found);
+			}
+			fprintf(stderr, "\n\nTotal time elapsed from submision start to end: %fms, \n",
+							compute_time_in_ms(submission_start, platform_get_high_res_timer_stamp()));
+			read_avg_diff /= read_max_runs;
+			fprintf(stderr, "Point read time: %fms\n",
+							((double)read_avg_diff / (double)platform_high_res_timer_freq()) * 1000);
+		} else if (command == "end") {
+      break;
     }
-    mpmc_end_producer(&io_queue);
-  }
-
-	mpmc_work_queue_stop(&io_queue);
-	mpmc_work_queue_spinlock_till_finished(&io_queue);
-
-
-	writer_thread_context->stop_flag.store(true, std::memory_order::release);
-	while (!writer_thread_context->finished.load(std::memory_order::acquire)) {
-    writer_thread_context->finished.wait(writer_thread_context->finished);
 	}
 
 	for (int i = 0; i < thread_count; ++i) {
@@ -239,71 +376,6 @@ int main(int argc, char *argv[])
 	}
 
   writer_thread->join();
-  auto submission_end = platform_get_high_res_timer_stamp();
 
-  #if 0
-  auto page_header = (DataPageHeader *)page_allocator_alloc(DATA_PAGE_SIZE);
-  ASIOContext asio_context = {};
-  platform_asio_create(&asio_context);
-
-  auto read_max_runs = 100;
-  auto read_avg_diff = 0;
-	for (int i = 0; i < read_max_runs; ++i) {
-		auto start_read_time = platform_get_high_res_timer_stamp();
-		auto schema_maps_result = schema_maps_get_latest_version_inc_refcount(&db_context->schema_maps_tripple_buffer);
-		auto schema_map = schema_maps_result.maps;
-		auto table_id = schema_maps_lookup_table_id(schema_map, string8_from_cstring("table0"));
-		assert(table_id.id != 0);
-		auto &hot_partition_info = db_context->hot_partition_file_handles[table_id.index];
-		auto file_header = (HotPartitionHeader *)hot_partition_info.header_mapping.mapping;
-		auto data_page_count = load_acquire_64(&file_header->data_page_count);
-    auto timestamp = (11111 + i*10000) % 10000000;
-		auto found = false;
-		auto found_idx = 0;
-
-		MemoryMappedFile memory_map_page = {};
-		for (int i = 0; i < data_page_count; ++i) {
-			if (timestamp >= file_header->timestamp_intervals[i].start_timestamp &&
-					timestamp <= file_header->timestamp_intervals[i].end_timestamp) {
-				found = true;
-				found_idx = i;
-				break;
-			}
-		}
-
-		platform_asio_submit_read(&asio_context, hot_partition_info.file_handle, file_header->data_page_offsets[found_idx],
-															DATA_PAGE_SIZE, page_header, DATA_PAGE_SIZE, 0);
-
-		auto entry = platform_asio_completed_entry_dequeue(&asio_context);
-		while (entry == nullptr) {
-			entry = platform_asio_completed_entry_dequeue(&asio_context);
-		}
-
-		auto row_ptr = (uint8_t *)page_header + sizeof(DataPageHeader);
-		while (row_ptr < row_ptr + page_header->bytes_written) {
-			if (*(uint64_t *)(row_ptr + *(uint64_t *)row_ptr - 8) == timestamp) {
-				//fprintf(stderr, "found timestamp 11111\n");
-				break;
-			}
-			row_ptr += *(uint64_t *)row_ptr;
-		}
-
-		read_avg_diff += platform_get_high_res_timer_stamp() - start_read_time;
-
-    assert(found);
-	}
-  #endif
-
-	for (int i = 0; i < thread_count; ++i) {
-    auto avg_diff = (double)thread_context_array[i].timer_diffs / (double)thread_context_array[i].run_count;
-    fprintf(outfile, "Avg time thread %d: %fms, runs: %I64d\n", i, ((double)avg_diff / (double)platform_high_res_timer_freq()) * 1000, thread_context_array[i].run_count);
-  }
-
-  auto avg_writer_diff = writer_thread_context->timer_diffs / writer_thread_context->run_count;
-  fprintf(outfile, "Avg writer thread time: %fms, runs: %I64d\n", ((double)avg_writer_diff / (double)platform_high_res_timer_freq()) * 1000, writer_thread_context->run_count);
-  //read_avg_diff /= read_max_runs;
-  //fprintf(stderr, "Point read time: %fms\n", ((double)read_avg_diff / (double)platform_high_res_timer_freq()) * 1000);
-	fprintf(outfile, "\n\nTotal time elapsed from submision start to end: %fms, \n", compute_time_in_ms(submission_start, platform_get_high_res_timer_stamp()));
-  fclose(outfile);
 	return 0;
 }

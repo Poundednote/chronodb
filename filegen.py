@@ -23,9 +23,9 @@ elif filetype == "exist":
     with open("outfile.data", "w") as file_handler:
         for i in range(n_rows):
             if random.randint(0, 1):
-                line = f"table0 {i} [] testcolumn0={random.randint(0, 999)}, testcolumn1={random.randint(0, 999)}, new_str_col='TESTSTRING'\n"
+                line = f"table0 {i} [] testcolumn0={i}, testcolumn1={i}, new_str_col='TESTSTRING'\n"
             else:
-                line = f"table0 {i} [] testcolumn0={random.randint(0, 999)}, newcol={random.randint(0, 999)}, new_str_col='TESTSTRING'\n"
+                line = f"table0 {i} [] testcolumn0={i}, newcol={i}, new_str_col='TESTSTRING'\n"
             file_handler.write(line)
 
 elif filetype == "o3":

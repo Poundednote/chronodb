@@ -366,12 +366,13 @@ void writer_queues_advance_version_and_process_queue(DatabaseContext *db_context
 
 
 				while (!platform_asio_submit_write_buffer_info_array(
-					&writer_context->asio_context, hot_partition_info->file_handle, hot_partition_info->file_offset,
+					&writer_context->asio_context, hot_partition_info->file_handle, hot_partition_header->total_bytes_written,
 					batched_io_info->buffer_info_array, batched_io_info->total_bytes, entry.thread_id)) {
 					process_completed_writes(&writer_context->asio_context, db_context->hot_partition_file_handles, &writer_context->batched_info_pool, db_context->thread_context_array);
 				}
 				store_release_64(&hot_partition_header->data_page_count, hot_partition_header->data_page_count += total_pages);
         store_release_64(&hot_partition_header->total_bytes_written, hot_partition_header->total_bytes_written + batched_io_info->total_bytes);
+        assert(batched_io_info->total_bytes % 4096 == 0);
 				hot_partition_info->file_offset += batched_io_info->total_bytes;
 
         batched_io_info = pool_alloc(&writer_context->batched_info_pool);
@@ -406,11 +407,12 @@ void writer_queues_advance_version_and_process_queue(DatabaseContext *db_context
 		store_release_64(&hot_partition_header->data_page_count, hot_partition_header->data_page_count += total_pages);
 
 		while (!platform_asio_submit_write_buffer_info_array(
-			&writer_context->asio_context, hot_partition_info->file_handle, hot_partition_info->file_offset,
+			&writer_context->asio_context, hot_partition_info->file_handle, hot_partition_header->total_bytes_written,
 			batched_io_info->buffer_info_array, batched_io_info->total_bytes, entry.thread_id)) {
       process_completed_writes(&writer_context->asio_context, db_context->hot_partition_file_handles, &writer_context->batched_info_pool, db_context->thread_context_array);
 		}
     store_release_64(&hot_partition_header->total_bytes_written, hot_partition_header->total_bytes_written + batched_io_info->total_bytes);
+    assert(batched_io_info->total_bytes % 4096 == 0);
     hot_partition_info->file_offset += batched_io_info->total_bytes;
 
 		auto ingestion_schema_maps = &db_context->thread_context_array[entry.thread_id].schema_maps;
